@@ -1,0 +1,31 @@
+{
+  "paths": {
+    "main_memory": "memory/mainmemory.txt",
+    "cache_memory": "memory/cachememory.txt",
+    "tool_dir": "tools/"
+  },
+  "permissions": {
+    "auto_approve_safe": true,
+    "confirmation_channel": "whatsapp",
+    "safe_tools": [
+      "file_search",
+      "system_diagnostics",
+      "memory_diagnostics",
+      "media_open",
+      "media_play",
+      "youtube_open",
+      "youtube_search",
+      "spotify_open",
+      "spotify_play",
+      "keyboard_rgb",
+      "display_control",
+      "audio_control",
+      "teaching_mode",
+      "web_research_then_teach"
+    ]
+  },
+  "settings": {
+    "debug_mode": true,
+    "log_actions": true
+  }
+}
