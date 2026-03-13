@@ -5,7 +5,7 @@ PART: 4/10 — Computer Control (perception + action)
 Owner / Pen name: Divyansh (Bazric)
 AI Name: Avril (Satomi)
 Stack: Python (Flask + Ollama) backend | Node.js (Baileys) WhatsApp bot | Vanilla JS UI
-Exported: 2026-03-13 21:54:22
+Exported: 2026-03-13 22:46:37
 Section: computer_use (smart_click, type_into), ui_parser (YOLO), screen_map (OCR), actions, window_mgr, browser_control
 ================================================================================
 
