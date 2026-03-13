@@ -17,6 +17,17 @@ GOALS_FILE = os.path.join(MEMORY_DIR, "goals.json")
 SYSTEM_STATE_FILE = os.path.join(MEMORY_DIR, "system_state.json")
 VECTOR_STORE = os.path.join(MEMORY_DIR, "vector_store.json")
 FACTS_FILE = os.path.join(MEMORY_DIR, "facts.json")
+SCREEN_CACHE_FILE  = os.path.join(MEMORY_DIR, "screen_cache.json")
+TODOS_FILE         = os.path.join(MEMORY_DIR, "todos.json")
+
+# Temp folder for live screenshots and OCR output
+SCREENSHOT_DIR = os.path.join(BASE_DIR, "screenshot")
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+# UI detection model (YOLO .pt file) — set in system_config.json or use default
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+UI_MODEL_PATH = os.path.join(MODELS_DIR, "ui_detect.pt")
 
 # === Constants ===
 USER_NAME = "Divyansh"
@@ -58,5 +69,5 @@ def safe_load_json(path, default=None):
     try:
         with open(path, "r") as f:
             return json.load(f)
-    except:
+    except Exception:
         return default

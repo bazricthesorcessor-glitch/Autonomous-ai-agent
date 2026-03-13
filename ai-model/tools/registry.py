@@ -39,8 +39,8 @@ TOOL_CATEGORIES = {
     },
     "computer_tools": {
         "label": "Desktop & Computer Control",
-        "desc":  "Screen automation, mouse/keyboard, window management, screenshots",
-        "tools": ["computer_use", "actions", "window_manager", "screenshot"],
+        "desc":  "Screen automation, mouse/keyboard, window management, screenshots, UI detection",
+        "tools": ["computer_use", "actions", "window_manager", "screenshot", "ui_parser"],
     },
     "filesystem_tools": {
         "label": "Files & Code",
@@ -76,6 +76,7 @@ def _load():
     from tools import google       # tools/google/ package (drive, calendar, classroom)
     from tools import computer_use    # screen OCR + mouse/keyboard automation
     from tools import browser_control  # Playwright DOM-based web automation (Layer 1)
+    from tools import ui_parser       # YOLO UI detection + targeted OCR
     _REGISTRY = {
         'system_diagnostics': system_diagnostics,
         'file_search':        files,
@@ -90,6 +91,7 @@ def _load():
         'computer_use':       computer_use,
         'browser_control':    browser_control,
         'code':               code,
+        'ui_parser':          ui_parser,
     }
 
     # Optional: load actions tool if ydotool is available
