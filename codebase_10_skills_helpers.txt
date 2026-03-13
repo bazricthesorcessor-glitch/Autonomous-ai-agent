@@ -1,0 +1,905 @@
+================================================================================
+PROJECT: AVRIL — Personal Advanced AI Assistant
+PART: 10/10 — Skills + Helpers + Legacy
+================================================================================
+Owner / Pen name: Divyansh (Bazric)
+AI Name: Avril (Satomi)
+Stack: Python (Flask + Ollama) backend | Node.js (Baileys) WhatsApp bot | Vanilla JS UI
+Exported: 2026-03-13 21:54:22
+Section: skill_builder (approval gate), AI-learned skills, launcher scripts, engineering brief, legacy code
+================================================================================
+
+ARCHITECTURE:
+  User (Browser)
+      |
+  [ui/index.html]  <-- standalone dark-theme control panel (served at /app)
+      | fetch() via api.js
+      |
+  User (WhatsApp)
+      |
+  [whatsapp-ai-bot/server.js  :3000]  <-- index.html (Web Setup UI)
+      | axios POST /chat
+      |
+  [ai-model/core/api_server.py  :8000]  <-- main.py entry
+      |
+      +-- core/agent_loop.py        (2-tier fast path + plan-tool-respond loop)
+      +-- core/brain.py             (model routing + fallback)
+      +-- core/context_builder.py   (memory assembly, raw log truncation, screen cache)
+      +-- core/state.py             (agentic state machine)
+      +-- core/system_shortcuts.py  (Hyprland shortcuts for planner awareness)
+      +-- core/autonomous_mode.py   (global flag — enable/disable background tasks)
+      +-- engines/fact_engine.py    (structured facts — extracted BEFORE context build)
+      +-- engines/task_manager.py   (multi-task persistent tracking)
+      +-- engines/memory_engine.py  (vector search + add_memory)
+      +-- engines/janitor.py        (maintenance / summarizer trigger)
+      +-- engines/summarizer.py     (log summarization)
+      +-- engines/goal_scheduler.py (daemon thread — fires scheduled goals silently)
+      +-- engines/todo_manager.py   (CRUD for memory/todos.json)
+      +-- tools/registry.py         (tool loader + safe/risky gate + TOOL CATEGORIES)
+      +-- tools/files.py
+      +-- tools/screenshot.py       (active-window OCR, noise-filtered, writes screen_cache)
+      +-- tools/system_diagnostics.py
+      +-- tools/actions.py          (ydotool mouse/keyboard — individual low-level moves)
+      +-- tools/computer_use.py     (scan_screen, click_map, smart_click, type_into, open_url)
+      +-- tools/ui_parser.py        (YOLO UI detection + targeted OCR — replaces OCR-only)
+      +-- tools/screen_map.py       (structured element map: OCR fallback pipeline)
+      +-- tools/browser_control.py  (Playwright DOM-based web automation — Layer 1)
+      +-- tools/ui_positions.json   (pre-saved pixel positions per site/app)
+      +-- tools/window_manager.py   (hyprctl window/app control)
+      +-- tools/terminal_safe.py    (allowlisted safe shell execution)
+      +-- tools/todos.py            (agent tool — create/update/list/clear todos)
+      +-- tools/utilities.py        (flip_coin, roll_dice, time_now, convert_units, etc.)
+      +-- tools/skill_builder.py    (AI skill creation with USER APPROVAL GATE)
+      +-- tools/code.py             (sandboxed Python exec/eval — restricted builtins)
+      +-- tools/skills/             (AI-created skill files, auto-loaded on startup)
+      +-- tools/web/                (web tools package)
+      |     __init__.py, http_client.py, browser.py, search.py, fetch.py, wikipedia.py, inspect.py
+      +-- tools/pdf.py              (PDF read, info, topics, page extraction, keyword search)
+      +-- tools/google/             (Google Apps package — OAuth2)
+      |     __init__.py, auth.py, drive.py, calendar.py, classroom.py, gmail.py
+      +-- personality/              (persona prompts: default, coding, teacher, assistant)
+      +-- memory/                   (tasks.json, facts.json, todos.json, identity.json, goals.json, etc.)
+      +-- helpers/                  (start.sh, stop.sh, status.sh, engineering_brief.py)
+      +-- models/                   (UI detection model: ui_detect.pt)
+
+  API:  /chat  /health  /tasks  /status  /logs  /persona  /screen
+        /autonomous  /todos  /todos/<id>  /todos/clear-done  /tool-feed
+        /debug-screen  /ui-parse  /skills  /skills/<name>/approve|reject
+  UI:   http://localhost:8000/app  (new full control panel)
+        http://localhost:8000/ui   (legacy inline text console)
+  Principles:
+    - UI communicates only through HTTP — never imports AI code directly
+    - CORS enabled so ui/ can also be opened as a plain file://
+    - Skills require user approval before activation
+    - UI parser uses YOLO detection when model available, OCR fallback otherwise
+
+================================================================================
+FILE: ai-model/tools/skill_builder.py  [AI skill creation + approval gate]
+================================================================================
+# ========================= tools/skill_builder.py =========================
+"""
+Skill builder — lets the AI create, inspect, delete, and reload custom skill tools.
+
+Skills are regular Python modules stored in tools/skills/.
+Each must expose a run_tool(args: dict) -> str function.
+
+APPROVAL GATE: when the AI creates a skill, it is saved as PENDING.
+The user must explicitly approve the skill before it is hot-registered
+and callable by the agent.  This prevents runaway self-modification.
+
+Actions:
+  propose — AI writes skill code; saved as pending, NOT yet active
+  list    — list all skills (active + pending)
+  inspect — print a skill's full source code
+  delete  — delete a skill file and unregister it
+  reload  — (re-)load all approved skill files from disk
+  approve — user approves a pending skill → activates it
+  reject  — user rejects a pending skill → deletes the file
+"""
+
+import os
+import re
+import sys
+import json
+import importlib.util
+from datetime import datetime
+
+SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skills')
+_PENDING_META = os.path.join(SKILLS_DIR, '_pending.json')
+
+# Patterns that must NEVER appear in AI-generated skill code
+_DANGEROUS_PATTERNS = re.compile(
+    r'subprocess|os\.system|os\.popen|os\.exec|os\.remove|os\.unlink|shutil\.rmtree'
+    r'|__import__|eval\s*\(|exec\s*\(|open\s*\(.*/etc/'
+    r'|socket\.socket|http\.server|smtplib'
+    r'|ctypes|cffi|importlib\.import_module',
+    re.IGNORECASE,
+)
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _ensure_dir():
+    os.makedirs(SKILLS_DIR, exist_ok=True)
+    init = os.path.join(SKILLS_DIR, '__init__.py')
+    if not os.path.exists(init):
+        with open(init, 'w', encoding='utf-8') as f:
+            f.write('# AI-generated skills package\n')
+
+
+def _skill_path(name: str) -> str:
+    return os.path.join(SKILLS_DIR, f"{name}.py")
+
+
+def _import_module(name: str, path: str):
+    """Dynamically import a skill file and return the module object."""
+    spec = importlib.util.spec_from_file_location(f"tools.skills.{name}", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[f"tools.skills.{name}"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _doc_summary(path: str) -> str:
+    """Return the first meaningful line of the module docstring."""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        for q in ('"""', "'''"):
+            if q in content:
+                start = content.index(q) + 3
+                rest  = content[start:]
+                if q in rest:
+                    end = rest.index(q)
+                    doc = rest[:end].strip()
+                    return doc.split('\n')[0][:90]
+    except Exception:
+        pass
+    return ''
+
+
+# ── Pending skills metadata ──────────────────────────────────────────────────
+
+def _load_pending() -> dict:
+    """Load pending skills metadata: {name: {purpose, proposed_at}}."""
+    try:
+        with open(_PENDING_META, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_pending(data: dict):
+    _ensure_dir()
+    with open(_PENDING_META, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+
+def _is_pending(name: str) -> bool:
+    return name in _load_pending()
+
+
+# ── Action functions ──────────────────────────────────────────────────────────
+
+def _propose(args: dict) -> str:
+    """AI proposes a new skill. Saved to disk but NOT activated until user approves."""
+    name = str(args.get('name', '')).strip().replace(' ', '_').lower()
+    if not name:
+        return "[skill_builder] 'name' is required."
+    if not name.isidentifier():
+        return f"[skill_builder] Invalid name '{name}' — must be a valid Python identifier."
+
+    code = str(args.get('code', '')).strip()
+    if not code:
+        return "[skill_builder] 'code' is required."
+    if 'def run_tool' not in code:
+        return "[skill_builder] Skill code must contain a 'def run_tool(args)' function."
+
+    # Safety scan: block dangerous patterns
+    match = _DANGEROUS_PATTERNS.search(code)
+    if match:
+        return (
+            f"[skill_builder] BLOCKED: code contains forbidden pattern '{match.group()}'. "
+            "Skills cannot use subprocess, eval, exec, os.system, sockets, etc."
+        )
+
+    _ensure_dir()
+    path = _skill_path(name)
+
+    # Prepend a docstring header if code doesn't already have one
+    purpose = str(args.get('purpose', 'Custom skill')).strip()
+    if not (code.startswith('"""') or code.startswith("'''")):
+        header = (
+            f'"""\n'
+            f'Skill: {name}\n'
+            f'Purpose: {purpose}\n'
+            f'Created: {datetime.now().strftime("%Y-%m-%d")}\n'
+            f'Status: PENDING — awaiting user approval\n'
+            f'"""\n\n'
+        )
+        code = header + code
+
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(code)
+    except Exception as e:
+        return f"[skill_builder] Failed to write skill file: {e}"
+
+    # Mark as pending (NOT registered in the tool registry)
+    pending = _load_pending()
+    pending[name] = {
+        'purpose': purpose,
+        'proposed_at': datetime.now().isoformat(),
+        'file': path,
+    }
+    _save_pending(pending)
+
+    return (
+        f"Skill '{name}' proposed and saved to disk.\n"
+        f"Purpose: {purpose}\n"
+        f"File: {path}\n"
+        f"STATUS: PENDING — waiting for user approval.\n"
+        f"The user must run: !skill approve {name}  (or use the API)"
+    )
+
+
+def _approve(args: dict) -> str:
+    """User approves a pending skill → load and register it."""
+    name = str(args.get('name', '')).strip().lower()
+    if not name:
+        return "[skill_builder] 'name' is required."
+
+    pending = _load_pending()
+    if name not in pending:
+        return f"[skill_builder] '{name}' is not in the pending queue."
+
+    path = _skill_path(name)
+    if not os.path.exists(path):
+        pending.pop(name, None)
+        _save_pending(pending)
+        return f"[skill_builder] Skill file for '{name}' not found — removed from pending."
+
+    try:
+        mod = _import_module(name, path)
+        from tools import registry
+        registry.register(name, mod)
+    except Exception as e:
+        return f"[skill_builder] Skill '{name}' failed to load: {e}"
+
+    # Remove from pending
+    pending.pop(name, None)
+    _save_pending(pending)
+
+    return f"Skill '{name}' APPROVED and activated. You can now use tool='{name}'."
+
+
+def _reject(args: dict) -> str:
+    """User rejects a pending skill → delete the file."""
+    name = str(args.get('name', '')).strip().lower()
+    if not name:
+        return "[skill_builder] 'name' is required."
+
+    pending = _load_pending()
+    if name not in pending:
+        return f"[skill_builder] '{name}' is not in the pending queue."
+
+    path = _skill_path(name)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+    pending.pop(name, None)
+    _save_pending(pending)
+    return f"Skill '{name}' REJECTED and deleted."
+
+
+def _create(args: dict) -> str:
+    """Backward-compatible alias: 'create' now routes through the approval gate."""
+    return _propose(args)
+
+
+def _list(args: dict) -> str:
+    _ensure_dir()
+    files = sorted(
+        f for f in os.listdir(SKILLS_DIR)
+        if f.endswith('.py') and f != '__init__.py'
+    )
+    if not files:
+        return "No skills yet. Use action='propose' to teach a new one."
+
+    pending = _load_pending()
+    lines = [f"Skills ({len(files)}):", '─' * 50]
+    for fname in files:
+        name = fname[:-3]
+        desc = _doc_summary(_skill_path(name))
+        status = "PENDING" if name in pending else "ACTIVE"
+        lines.append(f"  [{status:7s}] {name:<20}  {desc}")
+
+    if pending:
+        lines.append(f"\nPending skills need approval: !skill approve <name>")
+
+    return '\n'.join(lines)
+
+
+def _inspect(args: dict) -> str:
+    name = str(args.get('name', '')).strip()
+    if not name:
+        return "[skill_builder] 'name' is required."
+    path = _skill_path(name)
+    if not os.path.exists(path):
+        return f"[skill_builder] Skill '{name}' not found."
+    pending = _load_pending()
+    status = "PENDING" if name in pending else "ACTIVE"
+    with open(path, 'r', encoding='utf-8') as f:
+        return f"=== {name}.py [{status}] ===\n{f.read()}"
+
+
+def _delete(args: dict) -> str:
+    name = str(args.get('name', '')).strip()
+    if not name:
+        return "[skill_builder] 'name' is required."
+    path = _skill_path(name)
+    if not os.path.exists(path):
+        return f"[skill_builder] Skill '{name}' not found."
+    try:
+        os.remove(path)
+        from tools import registry
+        registry.unregister(name)
+        # Also clean from pending if present
+        pending = _load_pending()
+        if name in pending:
+            pending.pop(name)
+            _save_pending(pending)
+        return f"Skill '{name}' deleted and unregistered."
+    except Exception as e:
+        return f"[skill_builder] Error: {e}"
+
+
+def _reload(args: dict) -> str:
+    """Reload all APPROVED skills from disk (skip pending ones)."""
+    _ensure_dir()
+    from tools import registry
+    pending = _load_pending()
+    files = sorted(
+        f for f in os.listdir(SKILLS_DIR)
+        if f.endswith('.py') and f != '__init__.py'
+    )
+    loaded, skipped, failed = [], [], []
+    for fname in files:
+        name = fname[:-3]
+        if name in pending:
+            skipped.append(name)
+            continue
+        path = _skill_path(name)
+        try:
+            mod = _import_module(name, path)
+            registry.register(name, mod)
+            loaded.append(name)
+        except Exception as e:
+            failed.append(f"{name}: {e}")
+
+    result = f"Reloaded {len(loaded)} skill(s): {loaded or 'none'}"
+    if skipped:
+        result += f"\nSkipped (pending approval): {skipped}"
+    if failed:
+        result += f"\nFailed: {failed}"
+    return result
+
+
+# ── Dispatcher ────────────────────────────────────────────────────────────────
+
+_ACTIONS = {
+    'propose': _propose,
+    'create':  _create,   # backward compat — now goes through approval gate
+    'list':    _list,
+    'inspect': _inspect,
+    'delete':  _delete,
+    'reload':  _reload,
+    'approve': _approve,
+    'reject':  _reject,
+}
+
+
+def run_tool(args: dict = None) -> str:
+    if args is None:
+        args = {}
+    action = str(args.get('action', 'list')).lower()
+    fn = _ACTIONS.get(action)
+    if fn is None:
+        return (
+            f"[skill_builder] Unknown action '{action}'. "
+            f"Available: {list(_ACTIONS.keys())}"
+        )
+    return fn(args)
+
+================================================================================
+FILE: ai-model/tools/skills/__init__.py  [skills package]
+================================================================================
+# tools/skills/
+# AI-generated skill files are stored here.
+# Each .py file exposes run_tool(args) and is hot-loaded by the registry.
+
+================================================================================
+FILE: ai-model/tools/skills/__init__.py
+================================================================================
+# tools/skills/
+# AI-generated skill files are stored here.
+# Each .py file exposes run_tool(args) and is hot-loaded by the registry.
+
+================================================================================
+FILE: ai-model/helpers/engineering_brief.py
+================================================================================
+# AVRIL ENGINEERING BRIEF
+# Owner: Divyansh (Bazric)
+# Date: 2026-03-12
+# Purpose: Reference document for system architecture, known bugs, and roadmap
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# PROJECT GOAL
+# Avril is a local autonomous AI assistant that can:
+# - Chat with the user via local LLM
+# - See the screen (OCR + DOM control via Playwright)
+# - Execute tasks on the computer
+# - Remember information (facts, tasks, goals, daily logs)
+# - Manage multi-step tasks with retry + loop detection
+# - Control the OS (Hyprland window manager, ydotool)
+# - Be controlled remotely via WhatsApp
+# - Provide a full UI control panel at localhost:8000/app
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ARCHITECTURE (3 Layers)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#   Browser UI (localhost:8000/app)
+#        ↓ HTTP (fetch)
+#   Python AI Backend (Flask :8000)
+#        ↓
+#   Agent Loop + Tools
+#
+#   Remote:
+#   WhatsApp → Node.js Baileys Bridge (:3000) → POST /chat → Python Backend
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOOL LAYERS (Priority Order)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#   Layer 1: browser_control (Playwright)  — websites, DOM-based, most reliable
+#   Layer 2: computer_use (OCR + ydotool)  — desktop apps, screen element map
+#   Layer 3: window_manager (hyprctl)      — OS window control
+#   Layer 4: terminal_safe                 — allowlisted shell commands
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# KNOWN BUGS (to fix)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 1. chat.js — duplicate user messages rendered sometimes
+# 2. Markdown italic regex uses negative lookbehind — breaks some browsers
+# 3. localStorage overflow — chat history stores full responses, no length cap
+# 4. Settings panel rebuilds DOM + handlers each open (memory leak)
+# 5. Screen watch — multiple polling intervals can stack
+# 6. WhatsApp group msgs — remoteJid vs participant mix-up
+# 7. WhatsApp reconnect — connection close can create multiple sockets
+# 8. No message length limit — huge messages can overload the AI
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECURITY RISKS
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 1. Prompt injection from group chats
+# 2. WhatsApp account compromise = OS control
+# 3. Tool risk classification needed: safe | interactive | dangerous
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROADMAP
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Performance:
+#   - Streaming token responses
+#   - Message batching for rapid inputs
+#
+# New capabilities:
+#   - Voice interface (mic → STT → AI → TTS)
+#   - File uploads (drag-and-drop images, PDFs, docs)
+#   - Multi-chat sessions in UI
+#   - Internal event bus (tool_run, task_created, ai_response)
+#
+# Visual task execution (partially implemented):
+#   - Playwright for websites (DONE)
+#   - Accessibility tree for desktop apps (pyatspi — planned)
+#   - OmniParser/YOLO for vision fallback (planned)
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# DESIGN PRINCIPLES
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 1. Local first — all intelligence runs locally
+# 2. Transparency — user sees what AI is doing
+# 3. Safety — dangerous ops require confirmation
+# 4. Modularity — UI, agent, tools, messaging stay separate
+
+================================================================================
+FILE: ai-model/helpers/start.sh
+================================================================================
+#!/usr/bin/env bash
+# ========================= helpers/start.sh =========================
+# Starts Avril AI backend as a background daemon and opens the UI.
+# The AI survives terminal close (uses setsid to fully detach).
+#
+# Usage:
+#   bash helpers/start.sh          — start + open UI
+#   bash helpers/start.sh --quiet  — start without opening browser
+# -----------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AI_DIR="$(dirname "$SCRIPT_DIR")"        # ai-model/
+VENV_PYTHON="$AI_DIR/.venv/bin/python"
+PID_FILE="$AI_DIR/helpers/.avril.pid"
+LOG_FILE="$AI_DIR/helpers/avril.log"
+PORT=8000
+UI_URL="http://localhost:$PORT/app"
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+_info()  { printf '\033[1;36m[Avril]\033[0m %s\n' "$*"; }
+_ok()    { printf '\033[1;32m[Avril]\033[0m %s\n' "$*"; }
+_err()   { printf '\033[1;31m[Avril]\033[0m %s\n' "$*"; }
+
+_is_running() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$PID_FILE"
+    fi
+    return 1
+}
+
+_wait_for_server() {
+    local max_wait=30
+    local waited=0
+    while (( waited < max_wait )); do
+        if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        (( waited++ ))
+    done
+    return 1
+}
+
+# ── main ─────────────────────────────────────────────────────────────
+
+# Already running?
+if _is_running; then
+    _ok "Avril is already running (PID $(cat "$PID_FILE"))"
+    firefox "$UI_URL" 2>/dev/null &
+    exit 0
+fi
+
+_info "Starting Avril..."
+
+# Verify venv Python exists
+if [[ ! -x "$VENV_PYTHON" ]]; then
+    _err "Virtual environment not found: $VENV_PYTHON"
+    _err "Run: python3 -m venv $AI_DIR/.venv && $AI_DIR/.venv/bin/pip install flask ollama flask-cors numpy"
+    exit 1
+fi
+
+# Launch as a fully detached daemon via setsid
+# Uses venv Python so all dependencies are available
+# stdout/stderr go to log file, process gets its own session
+setsid "$VENV_PYTHON" "$AI_DIR/main.py" \
+    >> "$LOG_FILE" 2>&1 &
+AVRIL_PID=$!
+
+# Save PID
+echo "$AVRIL_PID" > "$PID_FILE"
+
+_info "Daemon started (PID $AVRIL_PID) — log: $LOG_FILE"
+
+# Wait for the server to be ready
+_info "Waiting for server on port $PORT..."
+if _wait_for_server; then
+    _ok "Avril is live at $UI_URL"
+else
+    _err "Server did not respond within 30s — check $LOG_FILE"
+    exit 1
+fi
+
+# Open UI in Firefox (unless --quiet)
+if [[ "${1:-}" != "--quiet" ]]; then
+    firefox "$UI_URL" 2>/dev/null &
+    _ok "UI opened in Firefox"
+fi
+
+_ok "You can close this terminal — Avril keeps running."
+_info "To stop:  bash $SCRIPT_DIR/stop.sh"
+
+================================================================================
+FILE: ai-model/helpers/status.sh
+================================================================================
+#!/usr/bin/env bash
+# ========================= helpers/status.sh =========================
+# Check if Avril is running and show status.
+# -----------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AI_DIR="$(dirname "$SCRIPT_DIR")"
+PID_FILE="$AI_DIR/helpers/.avril.pid"
+LOG_FILE="$AI_DIR/helpers/avril.log"
+PORT=8000
+
+_info()  { printf '\033[1;36m[Avril]\033[0m %s\n' "$*"; }
+_ok()    { printf '\033[1;32m[Avril]\033[0m %s\n' "$*"; }
+_err()   { printf '\033[1;31m[Avril]\033[0m %s\n' "$*"; }
+
+if [[ -f "$PID_FILE" ]]; then
+    PID=$(cat "$PID_FILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        _ok "Avril is running (PID $PID)"
+
+        # Check API health
+        if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then
+            _ok "API is responding on port $PORT"
+        else
+            _err "API is not responding on port $PORT"
+        fi
+
+        # Show recent log
+        if [[ -f "$LOG_FILE" ]]; then
+            _info "Last 5 log lines:"
+            tail -5 "$LOG_FILE"
+        fi
+    else
+        _err "PID $PID not running (stale PID file)"
+        rm -f "$PID_FILE"
+    fi
+else
+    _err "Avril is not running"
+fi
+
+================================================================================
+FILE: ai-model/helpers/stop.sh
+================================================================================
+#!/usr/bin/env bash
+# ========================= helpers/stop.sh =========================
+# Gracefully stops the Avril AI daemon.
+#
+# Usage:
+#   bash helpers/stop.sh
+# -----------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AI_DIR="$(dirname "$SCRIPT_DIR")"
+PID_FILE="$AI_DIR/helpers/.avril.pid"
+
+_info()  { printf '\033[1;36m[Avril]\033[0m %s\n' "$*"; }
+_ok()    { printf '\033[1;32m[Avril]\033[0m %s\n' "$*"; }
+_err()   { printf '\033[1;31m[Avril]\033[0m %s\n' "$*"; }
+
+if [[ ! -f "$PID_FILE" ]]; then
+    _err "No PID file found — Avril may not be running."
+    # Try to find and kill by process name as fallback
+    PID=$(pgrep -f "python3.*main\.py" | head -1 || true)
+    if [[ -n "$PID" ]]; then
+        _info "Found Avril process: PID $PID"
+        kill "$PID" 2>/dev/null && _ok "Stopped." || _err "Could not stop PID $PID"
+    else
+        _info "No Avril process found."
+    fi
+    exit 0
+fi
+
+PID=$(cat "$PID_FILE")
+
+if kill -0 "$PID" 2>/dev/null; then
+    _info "Stopping Avril (PID $PID)..."
+    kill "$PID"
+    # Wait for clean exit
+    for i in $(seq 1 10); do
+        if ! kill -0 "$PID" 2>/dev/null; then
+            break
+        fi
+        sleep 0.5
+    done
+    # Force kill if still alive
+    if kill -0 "$PID" 2>/dev/null; then
+        _info "Force killing..."
+        kill -9 "$PID" 2>/dev/null
+    fi
+    _ok "Avril stopped."
+else
+    _info "Process $PID is not running (stale PID file)."
+fi
+
+rm -f "$PID_FILE"
+
+================================================================================
+FILE: ai-model/legacy/router.py  [LEGACY — old monolithic router]
+================================================================================
+import subprocess
+import re # IMPORT FOR REGEX
+from ollama import Client
+import os
+import memory_engine
+import fact_engine
+import config
+from datetime import datetime
+
+client = Client(host='http://localhost:11434')
+
+def execute(model_name, query):
+    # 1. READ STATIC MEMORY
+    str_personality, str_main, str_cache_b = "", "", ""
+
+    try:
+        with open(config.PERSONALITY_FILE, "r") as f: str_personality = f.read()
+        with open(config.MAIN_MEMORY, "r") as f: str_main = f.read()
+        with open(config.CACHE_B, "r") as f: str_cache_b = f.read()
+    except FileNotFoundError:
+        pass
+
+    # 2. RETRIEVAL LOGIC
+    search_keywords = ["remember", "my", "what did i", "our", "us", "journey", "history"]
+    should_search = any(word in query.lower() for word in search_keywords)
+
+    retrieved_context = ""
+    if should_search:
+        timeline_keywords = ["journey", "timeline", "history", "growth", "evolution"]
+        mode = "timeline" if any(word in query.lower() for word in timeline_keywords) else "relevance"
+
+        hits = memory_engine.search_memory(query, top_k=5, mode=mode)
+        if hits:
+            retrieved_context = "\n[RETRIEVED MEMORY]\n" + "\n".join(hits)
+
+    # 3. INJECT ACTIVE FACTS
+    active_facts = fact_engine.get_active_facts()
+    facts_block = "\n".join([f"- {k}: {v}" for k, v in active_facts.items()])
+    if not facts_block: facts_block = "None."
+
+    # 4. CONSTRUCT SYSTEM PROMPT
+    system_prompt = f"""SYSTEM INSTRUCTIONS:
+
+You are {config.AI_NAME}. You are NOT an AI. You are an obsessive anime girl assistant.
+
+[ACTIVE FACTS — HIGHEST PRIORITY]
+{facts_block}
+
+[PERSONALITY]
+{str_personality}
+
+[MAIN MEMORY — VERIFIED FACTS]
+{str_main}
+
+{retrieved_context}
+
+[CACHE B — RECENT CONTEXT]
+{str_cache_b}
+
+RULES:
+- If [ACTIVE FACTS] contradicts anything, trust [ACTIVE FACTS].
+- Maintain the persona defined in [PERSONALITY] at all times.
+- Never break character.
+"""
+
+    # 5. STREAM & LOG
+    with open(config.SESSION_LOG, "a") as log_file:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        header = f"{config.LOG_DELIMITER} {timestamp} | {config.USER_NAME}: {query}\n"
+
+        print(f"\n{config.AI_NAME}: ", end='', flush=True)
+        log_file.write(header)
+
+        try:
+            stream = client.chat(
+                model=model_name,
+                messages=[
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': query}
+                ],
+                stream=True
+            )
+
+            for chunk in stream:
+                if 'message' in chunk and 'content' in chunk['message']:
+                    content = chunk['message']['content']
+                    print(content, end='', flush=True)
+                    log_file.write(content)
+
+            print()
+            log_file.write("\n")
+
+        except Exception as e:
+            print(f"\n[Router Error]: {e}")
+            return
+
+    # 6. POST-RESPONSE: STATE UPDATE GATE (STRUCTURAL)
+    q_lower = query.lower().strip()
+
+    # DEFINE EXPLICIT MUTATION GRAMMAR
+    MUTATION_PATTERNS = [
+        r"^my .+ is .+",          # "my dog is bhuru"
+        r"^my .+ name is .+",     # "my dog name is bhuru"
+        r"^i am .+",              # "i am happy"
+        r"^i'm .+",               # "i'm a developer"
+        r"^i use .+",             # "i use arch linux"
+        r"^i have .+",            # "i have a dog"
+        r"^i switched to .+",     # "i switched to fedora"
+        r"^i don't have .+",      # "i don't have a dog"
+        r"^i do not have .+",     # "i do not have a dog"
+        r"^my .+ (died|passed away|is gone)", # "my dog died"
+        r"^forget .+",            # "forget my dog"
+        r"^call me .+",           # "call me avinash"
+    ]
+
+    # Check if query matches ANY mutation pattern
+    is_mutation = any(re.match(pattern, q_lower) for pattern in MUTATION_PATTERNS)
+
+    if is_mutation:
+        try:
+            fact_engine.process_fact_query(query)
+        except Exception as e:
+            print(f"[Fact Error] {e}")
+
+    # 7. POST-RESPONSE: SUMMARIZATION
+    try:
+        subprocess.run(["python", "ai_agent.py"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        pass
+
+================================================================================
+FILE: ai-model/legacy/ai_agent.py  [LEGACY — old summarizer agent]
+================================================================================
+from ollama import Client
+import config
+
+client = Client(host='http://localhost:11434')
+
+def run_agent():
+    try:
+        with open(config.SESSION_LOG, "r") as f:
+            chat_log = f.read()
+    except FileNotFoundError:
+        return
+
+    if not chat_log.strip(): return
+
+    prompt = f"""You are a summarizer.
+Summarize the following chat log into a short paragraph of facts.
+Ignore idle chatter.
+
+LOG:
+{chat_log}
+
+SUMMARY:
+"""
+
+    try:
+        response = client.chat(
+            model=config.CHAT_MODEL,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        summary = response['message']['content']
+
+        with open(config.CACHE_B, "w") as f:
+            f.write(summary)
+
+    except Exception as e:
+        print(f"[Agent Error] {e}")
+
+if __name__ == "__main__":
+    run_agent()
+
+================================================================================
+END OF 10/10 — Skills + Helpers + Legacy
+================================================================================

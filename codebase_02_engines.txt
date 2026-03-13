@@ -1,0 +1,996 @@
+================================================================================
+PROJECT: AVRIL — Personal Advanced AI Assistant
+PART: 2/10 — Engines (engines/)
+================================================================================
+Owner / Pen name: Divyansh (Bazric)
+AI Name: Avril (Satomi)
+Stack: Python (Flask + Ollama) backend | Node.js (Baileys) WhatsApp bot | Vanilla JS UI
+Exported: 2026-03-13 21:54:22
+Section: Memory, facts, tasks, goals, summarizer, janitor, todos
+================================================================================
+
+ARCHITECTURE:
+  User (Browser)
+      |
+  [ui/index.html]  <-- standalone dark-theme control panel (served at /app)
+      | fetch() via api.js
+      |
+  User (WhatsApp)
+      |
+  [whatsapp-ai-bot/server.js  :3000]  <-- index.html (Web Setup UI)
+      | axios POST /chat
+      |
+  [ai-model/core/api_server.py  :8000]  <-- main.py entry
+      |
+      +-- core/agent_loop.py        (2-tier fast path + plan-tool-respond loop)
+      +-- core/brain.py             (model routing + fallback)
+      +-- core/context_builder.py   (memory assembly, raw log truncation, screen cache)
+      +-- core/state.py             (agentic state machine)
+      +-- core/system_shortcuts.py  (Hyprland shortcuts for planner awareness)
+      +-- core/autonomous_mode.py   (global flag — enable/disable background tasks)
+      +-- engines/fact_engine.py    (structured facts — extracted BEFORE context build)
+      +-- engines/task_manager.py   (multi-task persistent tracking)
+      +-- engines/memory_engine.py  (vector search + add_memory)
+      +-- engines/janitor.py        (maintenance / summarizer trigger)
+      +-- engines/summarizer.py     (log summarization)
+      +-- engines/goal_scheduler.py (daemon thread — fires scheduled goals silently)
+      +-- engines/todo_manager.py   (CRUD for memory/todos.json)
+      +-- tools/registry.py         (tool loader + safe/risky gate + TOOL CATEGORIES)
+      +-- tools/files.py
+      +-- tools/screenshot.py       (active-window OCR, noise-filtered, writes screen_cache)
+      +-- tools/system_diagnostics.py
+      +-- tools/actions.py          (ydotool mouse/keyboard — individual low-level moves)
+      +-- tools/computer_use.py     (scan_screen, click_map, smart_click, type_into, open_url)
+      +-- tools/ui_parser.py        (YOLO UI detection + targeted OCR — replaces OCR-only)
+      +-- tools/screen_map.py       (structured element map: OCR fallback pipeline)
+      +-- tools/browser_control.py  (Playwright DOM-based web automation — Layer 1)
+      +-- tools/ui_positions.json   (pre-saved pixel positions per site/app)
+      +-- tools/window_manager.py   (hyprctl window/app control)
+      +-- tools/terminal_safe.py    (allowlisted safe shell execution)
+      +-- tools/todos.py            (agent tool — create/update/list/clear todos)
+      +-- tools/utilities.py        (flip_coin, roll_dice, time_now, convert_units, etc.)
+      +-- tools/skill_builder.py    (AI skill creation with USER APPROVAL GATE)
+      +-- tools/code.py             (sandboxed Python exec/eval — restricted builtins)
+      +-- tools/skills/             (AI-created skill files, auto-loaded on startup)
+      +-- tools/web/                (web tools package)
+      |     __init__.py, http_client.py, browser.py, search.py, fetch.py, wikipedia.py, inspect.py
+      +-- tools/pdf.py              (PDF read, info, topics, page extraction, keyword search)
+      +-- tools/google/             (Google Apps package — OAuth2)
+      |     __init__.py, auth.py, drive.py, calendar.py, classroom.py, gmail.py
+      +-- personality/              (persona prompts: default, coding, teacher, assistant)
+      +-- memory/                   (tasks.json, facts.json, todos.json, identity.json, goals.json, etc.)
+      +-- helpers/                  (start.sh, stop.sh, status.sh, engineering_brief.py)
+      +-- models/                   (UI detection model: ui_detect.pt)
+
+  API:  /chat  /health  /tasks  /status  /logs  /persona  /screen
+        /autonomous  /todos  /todos/<id>  /todos/clear-done  /tool-feed
+        /debug-screen  /ui-parse  /skills  /skills/<name>/approve|reject
+  UI:   http://localhost:8000/app  (new full control panel)
+        http://localhost:8000/ui   (legacy inline text console)
+  Principles:
+    - UI communicates only through HTTP — never imports AI code directly
+    - CORS enabled so ui/ can also be opened as a plain file://
+    - Skills require user approval before activation
+    - UI parser uses YOLO detection when model available, OCR fallback otherwise
+
+================================================================================
+FILE: ai-model/engines/__init__.py
+================================================================================
+
+================================================================================
+FILE: ai-model/engines/fact_engine.py  [structured fact extraction]
+================================================================================
+import json
+import os
+import re
+import tempfile
+import threading
+from datetime import datetime
+import config
+from ollama import Client
+
+client = Client(host='http://localhost:11434')
+FACTS_PATH = config.FACTS_FILE
+_facts_lock = threading.Lock()
+
+# STRICT TAXONOMY
+ALLOWED_CATEGORIES = [
+    "name", "os", "location", "language",
+    "dog", "favorite_anime", "job", "project", "user"
+]
+
+# Fast pre-filter: only call LLM when message likely contains a fact
+_FACT_SIGNALS = re.compile(
+    r'\b(?:my name|i am|i\'m|i live|i moved|i have|i got|i lost|i sold|'
+    r'i work|i use|i run|my dog|my cat|my pet|my job|my project|'
+    r'my fav|i like|i love|i prefer|i switched|i bought|died|passed away)\b',
+    re.IGNORECASE,
+)
+
+def load_facts():
+    if not os.path.exists(FACTS_PATH):
+        return {}
+    try:
+        with open(FACTS_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_facts(data):
+    dir_name = os.path.dirname(FACTS_PATH) or '.'
+    os.makedirs(dir_name, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, FACTS_PATH)
+    except Exception:
+        os.unlink(tmp)
+        raise
+
+def update_fact(category, value):
+    with _facts_lock:
+        facts = load_facts()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        if category not in facts:
+            facts[category] = {"current": None, "history": []}
+
+        if facts[category]["current"] is not None:
+            facts[category]["history"].append({
+                "value": facts[category]["current"],
+                "valid_to": now
+            })
+
+        facts[category]["current"] = value
+        save_facts(facts)
+        print(f"[Fact Engine] Updated {category}: {value}")
+
+def forget_fact(category):
+    with _facts_lock:
+        facts = load_facts()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        if category in facts and facts[category]["current"] is not None:
+            facts[category]["history"].append({
+                "value": facts[category]["current"],
+                "valid_to": now,
+                "status": "forgotten"
+            })
+            facts[category]["current"] = None
+            save_facts(facts)
+            print(f"[Fact Engine] Forgot {category}")
+
+def get_active_facts():
+    facts = load_facts()
+    return {k: v["current"] for k, v in facts.items() if v["current"] is not None}
+
+def process_fact_query(query):
+    # Fast exit: skip LLM call if message doesn't look like a factual statement
+    if not _FACT_SIGNALS.search(query):
+        return
+
+    prompt = f"""You are a structured data extractor.
+Extract facts from the statement.
+
+ALLOWED CATEGORIES:
+{json.dumps(ALLOWED_CATEGORIES)}
+
+CURRENT FACTS:
+{json.dumps(get_active_facts())}
+
+USER INPUT:
+"{query}"
+
+TASK:
+- Extract updates.
+- Detect loss (e.g., "died", "sold", "lost") -> action "forget".
+- Use ONLY allowed categories.
+
+OUTPUT FORMAT:
+{{
+  "facts": [
+    {{"action": "update", "category": "key", "value": "value"}},
+    {{"action": "forget", "category": "key"}}
+  ]
+}}
+"""
+
+    try:
+        response = client.chat(
+            model=config.CHAT_MODEL,
+            messages=[{'role': 'user', 'content': prompt}],
+            format='json',
+            options={
+                "temperature": 0.0,
+                "top_p": 0.1
+            }
+        )
+        content = response['message']['content']
+
+        data = json.loads(content)
+
+        if not isinstance(data, dict): return
+        facts_list = data.get("facts", [])
+        if not isinstance(facts_list, list): return
+
+        for item in facts_list:
+            action = item.get("action")
+            cat = item.get("category")
+            val = item.get("value")
+
+            if cat not in ALLOWED_CATEGORIES:
+                print(f"[Fact Engine] Rejected invalid category: {cat}")
+                continue
+
+            if action == "update" and cat and val:
+                update_fact(cat, val)
+            elif action == "forget" and cat:
+                forget_fact(cat)
+
+    except json.JSONDecodeError:
+        print("[Fact Engine] JSON Parse Error.")
+    except Exception as e:
+        print(f"[Fact Engine] Error: {e}")
+
+================================================================================
+FILE: ai-model/engines/task_manager.py  [multi-step task tracking]
+================================================================================
+"""
+engines/task_manager.py
+
+Persistent task tracking. Tasks survive server restarts.
+
+Structure in memory/tasks.json:
+{
+  "active":    [ {task}, ... ],
+  "completed": [ {task}, ... ]
+}
+
+A task looks like:
+{
+  "id":          "ab12cd34",
+  "title":       "Fix wifi driver",
+  "description": "Full goal text including context Divyansh provided",
+  "credentials": {"wifi_ssid": "MyWifi", "wifi_password": "hunter2"},
+  "steps":       [ {"step": "...", "result": "...", "status": "done", "at": "..."} ],
+  "status":      "in_progress" | "completed" | "abandoned",
+  "created_at":  "2026-03-10 14:00",
+  "last_updated":"2026-03-10 14:12"
+}
+"""
+
+import json
+import os
+import uuid
+import tempfile
+import threading
+from datetime import datetime
+
+import config
+
+TASKS_PATH = config.TASKS_FILE
+_RESULT_TRIM = 400   # Characters to keep from each step result in stored history
+_MAX_COMPLETED = 100  # Keep only the most recent completed/abandoned tasks
+_task_lock = threading.Lock()
+
+
+def _load() -> dict:
+    if not os.path.exists(TASKS_PATH):
+        return {"active": [], "completed": []}
+    try:
+        with open(TASKS_PATH, "r") as f:
+            content = f.read().strip()
+        if not content:
+            return {"active": [], "completed": []}
+        return json.loads(content)
+    except Exception:
+        return {"active": [], "completed": []}
+
+
+def _save(data: dict):
+    # Prune completed list to cap
+    completed = data.get("completed", [])
+    if len(completed) > _MAX_COMPLETED:
+        data["completed"] = completed[-_MAX_COMPLETED:]
+    dir_name = os.path.dirname(TASKS_PATH) or '.'
+    os.makedirs(dir_name, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, TASKS_PATH)
+    except Exception:
+        os.unlink(tmp)
+        raise
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+# ─── Public API ────────────────────────────────────────────────────────────────
+
+def create_task(title: str, description: str, credentials: dict = None) -> str:
+    """Create a new in-progress task. Returns the task id."""
+    with _task_lock:
+        data = _load()
+        task = {
+            "id":           str(uuid.uuid4())[:8],
+            "title":        title,
+            "description":  description,
+            "credentials":  credentials or {},
+            "steps":        [],
+            "status":       "in_progress",
+            "created_at":   _now(),
+            "last_updated": _now(),
+        }
+        data["active"].append(task)
+        _save(data)
+        print(f"[TaskManager] Created task {task['id']}: {title}")
+        return task["id"]
+
+
+def get_active_task() -> dict | None:
+    """Return the first in-progress task, or None."""
+    data = _load()
+    for task in data.get("active", []):
+        if task.get("status") == "in_progress":
+            return task
+    return None
+
+
+def get_active_tasks() -> list:
+    """Return ALL in-progress tasks. Planner should be aware of all of them."""
+    data = _load()
+    return [t for t in data.get("active", []) if t.get("status") == "in_progress"]
+
+
+def get_task_by_id(task_id: str) -> dict | None:
+    """Find a task by ID across active list."""
+    data = _load()
+    for task in data.get("active", []):
+        if task["id"] == task_id:
+            return task
+    return None
+
+
+def add_step_result(task_id: str, step_description: str, result: str, status: str = "done"):
+    """Append a completed step to the task's step log."""
+    with _task_lock:
+        data = _load()
+        for task in data["active"]:
+            if task["id"] == task_id:
+                task["steps"].append({
+                    "step":   step_description,
+                    "result": (result or "")[:_RESULT_TRIM],
+                    "status": status,
+                    "at":     _now(),
+                })
+                task["last_updated"] = _now()
+                _save(data)
+                return
+
+
+def complete_task(task_id: str, summary: str = ""):
+    """Mark a task as complete and archive it."""
+    with _task_lock:
+        data = _load()
+        for i, task in enumerate(data["active"]):
+            if task["id"] == task_id:
+                task["status"]       = "completed"
+                task["completed_at"] = _now()
+                task["summary"]      = summary
+                data["completed"].append(task)
+                data["active"].pop(i)
+                _save(data)
+                print(f"[TaskManager] Completed task {task_id}")
+                return
+
+
+def abandon_task(task_id: str, reason: str = ""):
+    """Mark a task as abandoned and archive it."""
+    with _task_lock:
+        data = _load()
+        for i, task in enumerate(data["active"]):
+            if task["id"] == task_id:
+                task["status"]        = "abandoned"
+                task["abandoned_at"]  = _now()
+                task["abandon_reason"] = reason
+                data["completed"].append(task)
+                data["active"].pop(i)
+                _save(data)
+                print(f"[TaskManager] Abandoned task {task_id}: {reason}")
+                return
+
+
+def abandon_all_active(reason: str = "user requested abort"):
+    """Abandon every in-progress task. Called by !abort command."""
+    with _task_lock:
+        data = _load()
+        now = _now()
+        still_active = []
+        for task in data["active"]:
+            if task.get("status") == "in_progress":
+                task["status"] = "abandoned"
+                task["abandoned_at"] = now
+                task["abandon_reason"] = reason
+                data["completed"].append(task)
+            else:
+                still_active.append(task)
+        data["active"] = still_active
+        _save(data)
+        print(f"[TaskManager] All tasks abandoned: {reason}")
+
+
+def get_task_context(task: dict) -> str:
+    """
+    Format a task's current state as a compact string for the planner.
+    Credentials are included so the agent can type passwords etc. without asking again.
+    """
+    if not task:
+        return ""
+
+    steps_lines = []
+    for i, s in enumerate(task.get("steps", []), 1):
+        result_preview = s.get("result", "")[:100].replace("\n", " ")
+        steps_lines.append(f"  {i}. [{s['status']}] {s['step']}: {result_preview}")
+
+    steps_text = "\n".join(steps_lines) if steps_lines else "  (none yet)"
+
+    creds = task.get("credentials", {})
+    creds_text = ""
+    if creds:
+        creds_text = f"\nCredentials: {json.dumps(creds)}"
+
+    return (
+        f"Task [{task['id']}]: {task['title']}\n"
+        f"Goal: {task['description']}"
+        f"{creds_text}\n"
+        f"Steps done:\n{steps_text}\n"
+        f"Last updated: {task.get('last_updated', '?')}"
+    )
+
+
+def get_all_tasks_context(tasks: list) -> str:
+    """Format ALL active tasks for the planner prompt."""
+    if not tasks:
+        return ""
+    blocks = [get_task_context(t) for t in tasks]
+    return "\n\n".join(blocks)
+
+================================================================================
+FILE: ai-model/engines/memory_engine.py  [vector store + cosine search]
+================================================================================
+# ========================= engines/memory_engine.py =========================
+import json
+import os
+import re
+import threading
+from ollama import Client
+import config
+
+client = Client(host='http://localhost:11434')
+MIN_SIMILARITY = 0.60
+_MIN_MEANINGFUL_LEN = 20    # Characters — ignore casual short messages
+MAX_VECTOR_MEMORIES = 5000  # Prune oldest entries beyond this limit
+
+# In-memory cache to avoid re-parsing vector_store.json on every call
+_vs_cache: list | None = None
+_vs_mtime: float = 0.0
+_vs_lock = threading.Lock()
+_write_lock = threading.Lock()   # serialise read-modify-write in add_memory
+
+
+def _load_vector_store() -> list:
+    """Load vector store with mtime-based caching."""
+    global _vs_cache, _vs_mtime
+    path = config.VECTOR_STORE
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return []
+    mtime = os.path.getmtime(path)
+    with _vs_lock:
+        if _vs_cache is not None and mtime == _vs_mtime:
+            return _vs_cache
+    data = config.safe_load_json(path, [])
+    if not isinstance(data, list):
+        data = []
+    with _vs_lock:
+        _vs_cache = data
+        _vs_mtime = mtime
+    return data
+
+
+def _invalidate_cache():
+    """Mark cache as stale after a write."""
+    global _vs_cache, _vs_mtime
+    with _vs_lock:
+        _vs_cache = None
+        _vs_mtime = 0.0
+
+
+def get_embedding(text):
+    if not text.strip(): return None
+    try:
+        clean_text = re.sub(r'\s+', ' ', text).strip()
+        response = client.embeddings(model=config.EMBED_MODEL, prompt=clean_text)
+        return response['embedding']
+    except Exception as e:
+        print(f"Embedding error: {e}")
+        return None
+
+
+def similarity(vec1, vec2):
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = sum(a * a for a in vec1) ** 0.5
+    norm2 = sum(b * b for b in vec2) ** 0.5
+    return dot / (norm1 * norm2) if norm1 and norm2 else 0
+
+
+def search_memory(query, top_k=3):
+    data = _load_vector_store()
+    if not data:
+        return []
+
+    q_emb = get_embedding(query)
+    if not q_emb: return []
+
+    scored = []
+    for item in data:
+        if 'embedding' not in item: continue
+        score = similarity(q_emb, item['embedding'])
+        if score >= MIN_SIMILARITY:
+            scored.append((score, item['text']))
+
+    scored.sort(reverse=True)
+    return [text for sc, text in scored[:top_k]]
+
+
+def add_memory(text: str) -> bool:
+    """
+    Store a meaningful statement in the vector store for later retrieval.
+    Returns True if stored, False if skipped (too short or embedding failed).
+
+    Only stores text >= _MIN_MEANINGFUL_LEN characters.
+    Embedding is generated and stored alongside the text.
+    """
+    if not text or len(text.strip()) < _MIN_MEANINGFUL_LEN:
+        return False
+
+    embedding = get_embedding(text)
+    if not embedding:
+        return False
+
+    import tempfile
+
+    with _write_lock:
+        # Load existing store (list of {text, embedding} dicts)
+        data = _load_vector_store()
+
+        data.append({"text": text.strip(), "embedding": embedding})
+
+        # Prune oldest entries to stay within the size limit
+        if len(data) > MAX_VECTOR_MEMORIES:
+            data = data[-MAX_VECTOR_MEMORIES:]
+
+        dir_name = os.path.dirname(config.VECTOR_STORE) or '.'
+        os.makedirs(dir_name, exist_ok=True)
+        try:
+            fd, tmp = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(data, f)
+                os.replace(tmp, config.VECTOR_STORE)
+            except Exception:
+                os.unlink(tmp)
+                raise
+            _invalidate_cache()
+            return True
+        except Exception as e:
+            print(f"[MemoryEngine] Failed to save vector store: {e}")
+            return False
+
+================================================================================
+FILE: ai-model/engines/janitor.py  [maintenance + summarizer trigger]
+================================================================================
+# ========================= engines/janitor.py =========================
+import os
+import config
+from engines import summarizer
+
+def run_maintenance():
+    print("Running Maintenance Cycle...")
+
+    # 1. Trigger Summarization for old logs
+    summarizer.run_summarization()
+
+    # 2. Check for oversized raw logs (Safety)
+    # (This prevents a single day from exploding the context)
+    check_raw_log_limits()
+
+    print("Maintenance Complete.")
+
+def check_raw_log_limits():
+    if not os.path.exists(config.DAILY_DIR):
+        return
+
+    # Simple check: if today's raw log is too big, warn or truncate.
+    # For now, we will just warn.
+    today_raw = config.get_raw_log_path()
+    if os.path.exists(today_raw):
+        size = os.path.getsize(today_raw)
+        # Approx 4 chars per token. 8000 tokens ~ 32KB text.
+        if size > 100000: # 100KB warning threshold
+            print(f"Warning: Today's log is large ({size} bytes). Consider starting a new session.")
+
+================================================================================
+FILE: ai-model/engines/summarizer.py  [LLM-based log summarization]
+================================================================================
+# ========================= engines/summarizer.py =========================
+import os
+from datetime import datetime
+from ollama import Client
+import config
+
+client = Client(host='http://localhost:11434')
+
+# Approximate character limit to stay within LLM context window
+_MAX_LOG_CHARS = 12000
+
+
+def generate_summary(raw_log_path):
+    if not os.path.exists(raw_log_path): return None
+    with open(raw_log_path, "r") as f: content = f.read()
+    if not content.strip(): return "Empty log."
+
+    # Truncate to avoid blowing context; keep tail (most recent messages)
+    if len(content) > _MAX_LOG_CHARS:
+        content = "... [truncated older messages] ...\n" + content[-_MAX_LOG_CHARS:]
+
+    prompt = f"""
+Summarize this conversation log into a structured format.
+Focus on key information, decisions, and technical details.
+
+LOG:
+{content}
+
+OUTPUT FORMAT:
+Topics: [List key topics discussed]
+Decisions Made: [List any decisions]
+Technical Changes: [List code, commands, or errors]
+Unresolved Issues: [List open questions]
+Important User States: [Mood, preferences, location changes]
+"""
+    try:
+        response = client.chat(model=config.CHAT_MODEL, messages=[{'role': 'user', 'content': prompt}], options={'temperature': 0.1})
+        return response['message']['content']
+    except Exception as e:
+        print(f"Summarization error: {e}")
+        return "Summary generation failed."
+
+def run_summarization():
+    print("Running Daily Summarization...")
+    if not os.path.exists(config.DAILY_DIR): return
+
+    today = datetime.now().date()
+    folders = sorted([f for f in os.listdir(config.DAILY_DIR) if os.path.isdir(os.path.join(config.DAILY_DIR, f))])
+
+    for folder in folders:
+        try:
+            folder_date = datetime.strptime(folder, "%Y-%m-%d").date()
+            age_days = (today - folder_date).days
+
+            raw_path = os.path.join(config.DAILY_DIR, folder, "raw.log")
+            summary_path = os.path.join(config.DAILY_DIR, folder, "summary.txt")
+
+            # FIX: Only summarize if older than RAW_DAYS_WINDOW (10 days)
+            if os.path.exists(raw_path) and not os.path.exists(summary_path):
+                if age_days > config.RAW_DAYS_WINDOW:
+                    print(f"Summarizing {folder} (Day {age_days})...")
+                    summary_text = generate_summary(raw_path)
+                    with open(summary_path, "w") as f:
+                        f.write(summary_text)
+                    print(f"Created summary for {folder}")
+                    # Remove raw log to reclaim disk once summary exists
+                    try:
+                        os.remove(raw_path)
+                        print(f"Cleaned up raw log for {folder}")
+                    except OSError as rm_err:
+                        print(f"[Summarizer] Could not remove {raw_path}: {rm_err}")
+        except ValueError:
+            continue
+
+if __name__ == "__main__":
+    run_summarization()
+
+================================================================================
+FILE: ai-model/engines/goal_scheduler.py  [background daemon for goals]
+================================================================================
+# ========================= engines/goal_scheduler.py =========================
+"""
+Autonomous Goal Scheduler — makes Avril proactive.
+
+Reads memory/goals.json for "scheduled" goal entries.
+Each entry has:
+  id                — unique identifier
+  prompt            — what to ask the agent loop
+  interval_minutes  — how often to run
+  enabled           — if false, skip
+  last_run          — ISO timestamp of last execution (updated after each run)
+
+The scheduler runs in a background daemon thread.
+It wakes every CHECK_INTERVAL seconds and fires any goals that are due.
+
+Usage:
+    from engines.goal_scheduler import GoalScheduler
+    scheduler = GoalScheduler()
+    scheduler.start()
+"""
+
+import json
+import os
+import threading
+import time
+from datetime import datetime, timezone
+import config
+
+# How often the scheduler loop wakes up to check for due goals.
+# Shorter = more responsive; longer = less overhead.
+CHECK_INTERVAL_SECONDS = 60
+
+
+class GoalScheduler:
+    def __init__(self):
+        self._thread = None
+        self._stop_event = threading.Event()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def start(self):
+        """Start the background scheduler thread (daemon — dies with main process)."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="GoalScheduler")
+        self._thread.start()
+        print("[GoalScheduler] Started.")
+
+    def stop(self):
+        """Signal the scheduler to stop after the current sleep cycle."""
+        self._stop_event.set()
+        print("[GoalScheduler] Stop requested.")
+
+    # ── Internal loop ─────────────────────────────────────────────────────────
+
+    def _loop(self):
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception as e:
+                print(f"[GoalScheduler] Uncaught error in tick: {e}")
+            self._stop_event.wait(CHECK_INTERVAL_SECONDS)
+
+    def _tick(self):
+        """Check all scheduled goals and fire any that are due."""
+        # Respect the global autonomous mode flag — skip entire tick if disabled
+        try:
+            from core import autonomous_mode
+            if not autonomous_mode.is_enabled():
+                return
+        except Exception:
+            pass  # If module unavailable, proceed normally
+
+        data = config.safe_load_json(config.GOALS_FILE, {})
+        scheduled = data.get("scheduled", [])
+        if not scheduled:
+            return
+
+        changed = False
+        for goal in scheduled:
+            if not goal.get("enabled", True):
+                continue
+            if self._is_due(goal):
+                print(f"[GoalScheduler] Firing goal: {goal['id']}")
+                # Mark as run immediately to prevent re-firing while executing
+                goal["last_run"] = datetime.now(timezone.utc).isoformat()
+                changed = True
+                # Execute in a separate thread so we don't block the scheduler
+                threading.Thread(
+                    target=self._run_and_log,
+                    args=(goal.copy(),),
+                    daemon=True,
+                    name=f"Goal-{goal['id']}",
+                ).start()
+
+        if changed:
+            # Write updated last_run timestamps back to goals.json
+            try:
+                with open(config.GOALS_FILE, "w") as f:
+                    json.dump(data, f, indent=2)
+            except Exception as e:
+                print(f"[GoalScheduler] Failed to update goals.json: {e}")
+
+    def _is_due(self, goal: dict) -> bool:
+        """Return True if the goal should fire now."""
+        last_run = goal.get("last_run")
+        if not last_run:
+            return True  # Never run — fire immediately on first check
+
+        interval_minutes = goal.get("interval_minutes", 60)
+        try:
+            last_dt = datetime.fromisoformat(last_run)
+            # Make timezone-aware if naive
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            elapsed_minutes = (datetime.now(timezone.utc) - last_dt).total_seconds() / 60
+            return elapsed_minutes >= interval_minutes
+        except Exception:
+            return True  # Parse failure — fire to be safe
+
+    def _run_and_log(self, goal: dict):
+        """Execute a goal and log the result (meant to run in its own thread)."""
+        try:
+            result = self._run_goal(goal)
+            self._log_result(goal["id"], goal["prompt"], result)
+        except Exception as e:
+            print(f"[GoalScheduler] Goal '{goal['id']}' thread error: {e}")
+
+    def _run_goal(self, goal: dict) -> str:
+        """Execute one scheduled goal through the full agent loop."""
+        # Late import avoids circular dependency at module load time.
+        from core import agent_loop
+        from core import context_builder
+
+        prompt = goal.get("prompt", "Check system status.")
+        try:
+            memory_ctx = context_builder.build_context(prompt)
+            # Use a neutral system persona so goals don't conflict with user persona
+            persona = (
+                f"You are {config.AI_NAME}, an autonomous AI assistant. "
+                "You are running a scheduled background task — not responding to a user. "
+                "Be concise, take action if needed, and log what you did."
+            )
+            result = agent_loop.run_turn(prompt, persona, memory_ctx)
+            return result
+        except Exception as e:
+            return f"[GoalScheduler] Error running goal '{goal['id']}': {e}"
+
+    def _log_result(self, goal_id: str, prompt: str, result: str):
+        """Append the goal run result to today's raw log."""
+        try:
+            log_path = config.get_raw_log_path()
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            entry = (
+                f"\n{config.LOG_DELIMITER}\n"
+                f"[SCHEDULED GOAL: {goal_id}] {ts}\n"
+                f"Prompt: {prompt}\n"
+                f"Result: {result[:500]}\n"
+                f"{config.LOG_DELIMITER}\n"
+            )
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(entry)
+        except Exception as e:
+            print(f"[GoalScheduler] Failed to write log: {e}")
+
+================================================================================
+FILE: ai-model/engines/todo_manager.py  [todo CRUD]
+================================================================================
+# engines/todo_manager.py
+"""
+Manages Avril's todo list stored in memory/todos.json.
+
+Todos are session-persistent (survive restarts) but are meant for
+the current context — not long-term memory.
+
+Schema per item:
+  id         — short 8-char hex uuid
+  content    — the task description
+  status     — 'pending' | 'in_progress' | 'done'
+  created_at — ISO timestamp
+  updated_at — ISO timestamp (set on status change)
+"""
+
+import json
+import os
+import uuid
+import tempfile
+import threading
+from datetime import datetime
+import config
+
+# ── File path ─────────────────────────────────────────────────────────────────
+TODOS_FILE = config.TODOS_FILE
+_todo_lock = threading.Lock()
+
+
+# ── Private helpers ───────────────────────────────────────────────────────────
+
+def _load() -> list:
+    data = config.safe_load_json(TODOS_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def _save(todos: list) -> None:
+    dir_name = os.path.dirname(TODOS_FILE) or '.'
+    os.makedirs(dir_name, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(todos, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, TODOS_FILE)
+    except Exception:
+        os.unlink(tmp)
+        raise
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def get_all() -> list:
+    """Return all todos (all statuses)."""
+    return _load()
+
+
+def get_active() -> list:
+    """Return only pending and in-progress todos."""
+    return [t for t in _load() if t.get("status") != "done"]
+
+
+def create_items(items: list) -> list:
+    """
+    Create new todo items from a list of strings.
+    Returns the newly created items with their assigned ids.
+    """
+    todos = _load()
+    new_items = []
+    now = datetime.now().isoformat()
+    for content in items:
+        content = str(content).strip()
+        if not content:
+            continue
+        item = {
+            "id":         uuid.uuid4().hex[:8],
+            "content":    content,
+            "status":     "pending",
+            "created_at": now,
+        }
+        todos.append(item)
+        new_items.append(item)
+    _save(todos)
+    return new_items
+
+
+def update_status(todo_id: str, status: str) -> bool:
+    """
+    Update the status of a single todo item.
+    status must be: 'pending' | 'in_progress' | 'done'
+    Returns True on success, False if id not found.
+    """
+    valid = {"pending", "in_progress", "done"}
+    if status not in valid:
+        return False
+    todos = _load()
+    for item in todos:
+        if item.get("id") == todo_id:
+            item["status"]     = status
+            item["updated_at"] = datetime.now().isoformat()
+            _save(todos)
+            return True
+    return False
+
+
+def clear_done() -> int:
+    """Remove completed todos. Returns the count removed."""
+    todos   = _load()
+    active  = [t for t in todos if t.get("status") != "done"]
+    removed = len(todos) - len(active)
+    _save(active)
+    return removed
+
+
+def clear_all() -> None:
+    """Delete every todo."""
+    _save([])
+
+================================================================================
+END OF 2/10 — Engines (engines/)
+================================================================================

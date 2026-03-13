@@ -1,0 +1,2189 @@
+================================================================================
+PROJECT: AVRIL — Personal Advanced AI Assistant
+PART: 4/10 — Computer Control (perception + action)
+================================================================================
+Owner / Pen name: Divyansh (Bazric)
+AI Name: Avril (Satomi)
+Stack: Python (Flask + Ollama) backend | Node.js (Baileys) WhatsApp bot | Vanilla JS UI
+Exported: 2026-03-13 21:54:22
+Section: computer_use (smart_click, type_into), ui_parser (YOLO), screen_map (OCR), actions, window_mgr, browser_control
+================================================================================
+
+ARCHITECTURE:
+  User (Browser)
+      |
+  [ui/index.html]  <-- standalone dark-theme control panel (served at /app)
+      | fetch() via api.js
+      |
+  User (WhatsApp)
+      |
+  [whatsapp-ai-bot/server.js  :3000]  <-- index.html (Web Setup UI)
+      | axios POST /chat
+      |
+  [ai-model/core/api_server.py  :8000]  <-- main.py entry
+      |
+      +-- core/agent_loop.py        (2-tier fast path + plan-tool-respond loop)
+      +-- core/brain.py             (model routing + fallback)
+      +-- core/context_builder.py   (memory assembly, raw log truncation, screen cache)
+      +-- core/state.py             (agentic state machine)
+      +-- core/system_shortcuts.py  (Hyprland shortcuts for planner awareness)
+      +-- core/autonomous_mode.py   (global flag — enable/disable background tasks)
+      +-- engines/fact_engine.py    (structured facts — extracted BEFORE context build)
+      +-- engines/task_manager.py   (multi-task persistent tracking)
+      +-- engines/memory_engine.py  (vector search + add_memory)
+      +-- engines/janitor.py        (maintenance / summarizer trigger)
+      +-- engines/summarizer.py     (log summarization)
+      +-- engines/goal_scheduler.py (daemon thread — fires scheduled goals silently)
+      +-- engines/todo_manager.py   (CRUD for memory/todos.json)
+      +-- tools/registry.py         (tool loader + safe/risky gate + TOOL CATEGORIES)
+      +-- tools/files.py
+      +-- tools/screenshot.py       (active-window OCR, noise-filtered, writes screen_cache)
+      +-- tools/system_diagnostics.py
+      +-- tools/actions.py          (ydotool mouse/keyboard — individual low-level moves)
+      +-- tools/computer_use.py     (scan_screen, click_map, smart_click, type_into, open_url)
+      +-- tools/ui_parser.py        (YOLO UI detection + targeted OCR — replaces OCR-only)
+      +-- tools/screen_map.py       (structured element map: OCR fallback pipeline)
+      +-- tools/browser_control.py  (Playwright DOM-based web automation — Layer 1)
+      +-- tools/ui_positions.json   (pre-saved pixel positions per site/app)
+      +-- tools/window_manager.py   (hyprctl window/app control)
+      +-- tools/terminal_safe.py    (allowlisted safe shell execution)
+      +-- tools/todos.py            (agent tool — create/update/list/clear todos)
+      +-- tools/utilities.py        (flip_coin, roll_dice, time_now, convert_units, etc.)
+      +-- tools/skill_builder.py    (AI skill creation with USER APPROVAL GATE)
+      +-- tools/code.py             (sandboxed Python exec/eval — restricted builtins)
+      +-- tools/skills/             (AI-created skill files, auto-loaded on startup)
+      +-- tools/web/                (web tools package)
+      |     __init__.py, http_client.py, browser.py, search.py, fetch.py, wikipedia.py, inspect.py
+      +-- tools/pdf.py              (PDF read, info, topics, page extraction, keyword search)
+      +-- tools/google/             (Google Apps package — OAuth2)
+      |     __init__.py, auth.py, drive.py, calendar.py, classroom.py, gmail.py
+      +-- personality/              (persona prompts: default, coding, teacher, assistant)
+      +-- memory/                   (tasks.json, facts.json, todos.json, identity.json, goals.json, etc.)
+      +-- helpers/                  (start.sh, stop.sh, status.sh, engineering_brief.py)
+      +-- models/                   (UI detection model: ui_detect.pt)
+
+  API:  /chat  /health  /tasks  /status  /logs  /persona  /screen
+        /autonomous  /todos  /todos/<id>  /todos/clear-done  /tool-feed
+        /debug-screen  /ui-parse  /skills  /skills/<name>/approve|reject
+  UI:   http://localhost:8000/app  (new full control panel)
+        http://localhost:8000/ui   (legacy inline text console)
+  Principles:
+    - UI communicates only through HTTP — never imports AI code directly
+    - CORS enabled so ui/ can also be opened as a plain file://
+    - Skills require user approval before activation
+    - UI parser uses YOLO detection when model available, OCR fallback otherwise
+
+================================================================================
+FILE: ai-model/tools/computer_use.py  [high-level: smart_click, type_into, scan_screen]
+================================================================================
+# ========================= tools/computer_use.py =========================
+"""
+Computer use — high-level screen interaction for browser/app automation.
+
+Actions:
+  click_element   Look up a pre-saved pixel position and click it (most reliable)
+                  {"action": "click_element", "site": "youtube.com", "element": "search_bar"}
+
+  save_position   Read current cursor pos (hyprctl cursorpos) and save to map
+                  {"action": "save_position", "site": "youtube.com", "element": "search_bar"}
+
+  list_positions  Show all saved positions
+                  {"action": "list_positions"}
+                  {"action": "list_positions", "site": "youtube.com"}
+
+  focus_window    Bring app to foreground (do this before find_on_screen!)
+                  {"action": "focus_window", "app": "firefox"}
+
+  find_on_screen  Capture fullscreen, OCR with bounding boxes, return x,y of text
+                  {"action": "find_on_screen", "text": "Search"}
+
+  click_text      Find text on screen and click it (OCR-based, fallback when no saved pos)
+                  {"action": "click_text", "text": "Search"}
+
+  open_url        Open a URL in Firefox (launches new window or new tab)
+                  {"action": "open_url", "url": "https://youtube.com"}
+
+  type_text       Type text at current cursor position
+                  {"action": "type_text", "text": "coconut oil"}
+
+  press_key       Press a key or shortcut
+                  {"action": "press_key", "key": "Return"}
+                  {"action": "press_key", "key": "ctrl+l"}
+
+  screenshot      Fullscreen capture + OCR (to verify what's on screen)
+                  {"action": "screenshot"}
+
+Typical workflow for "search YouTube for coconut oil":
+  1. open_url       url=https://youtube.com
+  2. focus_window   app=firefox
+  3. press_key      key=slash   ← YouTube shortcut: '/' focuses search bar
+  4. type_text      text=coconut oil
+  5. press_key      key=Return
+
+Alternative using mouse (if keyboard shortcut not available):
+  3. click_text     text=Search   ← OCR finds search bar, moves mouse, clicks
+
+Notes:
+  - Requires ydotoold running: sudo ydotoold
+  - Requires grim (Wayland screen capture) and tesseract (OCR)
+  - find_on_screen uses tesseract TSV output for per-word bounding boxes
+"""
+
+import os
+import json as _json
+import time
+import subprocess
+import hashlib
+
+import config
+
+# Dedicated temp screenshot for computer_use (won't replace the main screenshot.png)
+_CU_PNG = os.path.join(config.SCREENSHOT_DIR, "_cu_screen.png")
+_CU_VERIFY_PNG = os.path.join(config.SCREENSHOT_DIR, "_cu_verify.png")
+
+# Persistent map of named pixel positions per site/app
+_UI_MAP_PATH = os.path.join(os.path.dirname(__file__), "ui_positions.json")
+
+
+def _load_map() -> dict:
+    try:
+        with open(_UI_MAP_PATH, "r") as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_map(data: dict) -> None:
+    with open(_UI_MAP_PATH, "w") as f:
+        _json.dump(data, f, indent=2)
+
+
+# ── Low-level helpers ─────────────────────────────────────────────────────────
+
+def _capture_fullscreen(path: str) -> bool:
+    """Use grim to capture the full screen. Returns True on success."""
+    try:
+        subprocess.run(
+            ["grim", path],
+            check=True, capture_output=True, timeout=8
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _tesseract_tsv(png_path: str) -> str:
+    """Run tesseract with TSV (bounding box) output. Returns raw TSV or ''."""
+    try:
+        result = subprocess.run(
+            ["tesseract", png_path, "stdout", "--psm", "3", "tsv"],
+            capture_output=True, text=True, check=True, timeout=30
+        )
+        return result.stdout
+    except Exception:
+        return ""
+
+
+def _find_coords(query: str, min_x=0, max_x=99999, min_y=0, max_y=99999) -> tuple | None:
+    """
+    Capture fullscreen, OCR with TSV bounding boxes, find `query`.
+    Optional region: min_x/max_x/min_y/max_y restrict which part of the screen to search.
+    Returns (cx, cy, matched_word, confidence) or None.
+    TSV columns (0-indexed): level page_num block_num par_num line_num word_num
+                              left top width height conf text
+    """
+    if not _capture_fullscreen(_CU_PNG):
+        return None
+
+    tsv = _tesseract_tsv(_CU_PNG)
+    if not tsv:
+        return None
+
+    q = query.strip().lower()
+    best       = None
+    best_score = -1
+
+    for line in tsv.strip().split('\n')[1:]:   # skip header row
+        parts = line.split('\t')
+        if len(parts) < 12:
+            continue
+        try:
+            conf = float(parts[10])
+            word = parts[11].strip().lower()
+        except (ValueError, IndexError):
+            continue
+
+        if conf < 20 or not word:
+            continue
+
+        # Only exact or contiguous-substring matches — no fuzzy letter-set tricks.
+        # This prevents words like "chainsmokers" (which share letters with "search")
+        # from matching the wrong element.
+        if q == word:
+            score = 100
+        elif len(q) >= 3 and len(word) >= 3 and (q in word or word in q):
+            # Penalise large length difference so "searchbar" ranks below "search"
+            score = 80 - abs(len(q) - len(word))
+        else:
+            continue
+
+        if score > best_score:
+            try:
+                cx = int(parts[6]) + int(parts[8]) // 2   # left + width/2
+                cy = int(parts[7]) + int(parts[9]) // 2   # top  + height/2
+                # Skip if outside the requested region
+                if not (min_x <= cx <= max_x and min_y <= cy <= max_y):
+                    continue
+                best_score = score
+                best = (cx, cy, word, conf)
+            except ValueError:
+                continue
+
+    return best if best_score > 0 else None
+
+
+def _get_window_region(app_class: str = "firefox"):
+    """
+    Ask Hyprland for the bounding box of the first matching window.
+    Returns (min_x, max_x, min_y, max_y) or (0, 99999, 0, 99999) on failure.
+    """
+    try:
+        r = subprocess.run(
+            ["hyprctl", "-j", "clients"],
+            capture_output=True, text=True, timeout=3
+        )
+        import json as _json
+        clients = _json.loads(r.stdout)
+        for c in clients:
+            if app_class.lower() in c.get("class", "").lower():
+                at   = c.get("at",   [0, 0])
+                size = c.get("size", [0, 0])
+                if size[0] > 50 and size[1] > 50:
+                    return at[0], at[0] + size[0], at[1], at[1] + size[1]
+    except Exception:
+        pass
+    return 0, 99999, 0, 99999
+
+
+def _ydotool(*cmd) -> str:
+    """Run a ydotool command. Returns 'ok' or an error string."""
+    try:
+        r = subprocess.run(
+            ["ydotool"] + list(cmd),
+            capture_output=True, text=True, timeout=5
+        )
+        return "ok" if r.returncode == 0 else (r.stderr.strip() or "unknown error")
+    except FileNotFoundError:
+        return "Error: ydotool not found — run: sudo ydotoold"
+    except subprocess.TimeoutExpired:
+        return "Error: ydotool timed out"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ── Action Verifier ──────────────────────────────────────────────────────────
+# After mutating actions (click, type, press_key), capture a verification
+# screenshot and compare its hash to the pre-action screenshot.  If the screen
+# didn't change, the action probably failed silently.
+
+def _screen_hash(png_path: str) -> str:
+    """Return a fast hash of the screenshot file (or '' on failure)."""
+    try:
+        with open(png_path, 'rb') as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except Exception:
+        return ""
+
+
+def _verify_action(action_desc: str, pre_hash: str) -> str:
+    """Take a post-action screenshot, compare hash, return a verification note.
+
+    Returns a short string like ' [verified: screen changed]' or
+    ' [warning: screen unchanged — action may have failed]'.
+    """
+    if not pre_hash:
+        return ""
+    time.sleep(0.5)  # give the GUI a moment to react
+    _capture_fullscreen(_CU_VERIFY_PNG)
+    post_hash = _screen_hash(_CU_VERIFY_PNG)
+    if not post_hash:
+        return ""
+    if pre_hash != post_hash:
+        return f" [verified: screen changed after {action_desc}]"
+    return f" [warning: screen unchanged after {action_desc} — action may have failed]"
+
+
+def _pre_snapshot() -> str:
+    """Capture the screen and return its hash (for before/after comparison)."""
+    _capture_fullscreen(_CU_VERIFY_PNG)
+    return _screen_hash(_CU_VERIFY_PNG)
+
+
+# ── Public tool dispatcher ────────────────────────────────────────────────────
+
+def run_tool(args: dict = None) -> str:
+    if args is None:
+        args = {}
+
+    action = str(args.get("action", "")).strip().lower()
+
+    # ── find_on_screen ────────────────────────────────────────────────────
+    if action == "find_on_screen":
+        text    = str(args.get("text", "")).strip()
+        if not text:
+            return "Error: 'text' parameter is required"
+        # Optional manual region override; otherwise use Firefox window bounds
+        app_hint = str(args.get("app", "firefox"))
+        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+        # Allow manual overrides
+        min_x = int(args.get("min_x", min_x))
+        max_x = int(args.get("max_x", max_x))
+        min_y = int(args.get("min_y", min_y))
+        max_y = int(args.get("max_y", max_y))
+        # Retry up to 3 times — handles pages still loading
+        match = None
+        for attempt in range(3):
+            match = _find_coords(text, min_x, max_x, min_y, max_y)
+            if match:
+                break
+            if attempt < 2:
+                time.sleep(1.5)
+        if match:
+            cx, cy, word, conf = match
+            return f"Found '{word}' at ({cx}, {cy})  [OCR confidence: {conf:.0f}]"
+        return (
+            f"Not found: '{text}' in {app_hint} window after 3 attempts. "
+            "Take a screenshot to confirm the page is loaded."
+        )
+
+    # ── click_text ────────────────────────────────────────────────────────
+    elif action == "click_text":
+        text = str(args.get("text", "")).strip()
+        if not text:
+            return "Error: 'text' parameter is required"
+        # Use Firefox window bounds to restrict OCR region — avoids hitting
+        # VS Code / other tiled windows that share the same screen space
+        app_hint = str(args.get("app", "firefox"))
+        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+        min_x = int(args.get("min_x", min_x))
+        max_x = int(args.get("max_x", max_x))
+        min_y = int(args.get("min_y", min_y))
+        max_y = int(args.get("max_y", max_y))
+        # Retry up to 4 times with 1.5s gap — handles pages still loading
+        match = None
+        for attempt in range(4):
+            match = _find_coords(text, min_x, max_x, min_y, max_y)
+            if match:
+                break
+            if attempt < 3:
+                time.sleep(1.5)
+        if not match:
+            return (
+                f"Could not find '{text}' in {app_hint} window after 4 attempts. "
+                "Take a screenshot to check what's visible, then retry."
+            )
+        cx, cy, word, conf = match
+        pre = _pre_snapshot()
+        out = _ydotool("mousemove", "--absolute", "-x", str(cx), "-y", str(cy))
+        if out != "ok":
+            return f"Mouse move to ({cx},{cy}) failed: {out}"
+        time.sleep(0.25)   # let Hyprland register the move before clicking
+        out = _ydotool("click", "0xC0")   # 0xC0 = left button DOWN + UP (full click)
+        if out != "ok":
+            return f"Click failed: {out}"
+        time.sleep(0.1)    # brief pause after click — let focus settle
+        verify = _verify_action("click_text", pre)
+        return f"Moved mouse to '{word}' at ({cx}, {cy}) and clicked{verify}"
+
+    # ── focus_window ──────────────────────────────────────────────────────
+    elif action == "focus_window":
+        app = str(args.get("app", "firefox")).strip()
+        for selector in (f"class:{app}", app):
+            try:
+                r = subprocess.run(
+                    ["hyprctl", "dispatch", "focuswindow", selector],
+                    capture_output=True, text=True, timeout=3
+                )
+                if r.returncode == 0:
+                    time.sleep(0.3)
+                    return f"Focused: {app}"
+            except Exception:
+                pass
+        return f"Could not focus window: {app}"
+
+    # ── open_url ──────────────────────────────────────────────────────────
+    elif action == "open_url":
+        url = str(args.get("url", "")).strip()
+        if not url:
+            return "Error: 'url' parameter is required"
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        # Use `firefox URL` — if Firefox is already running this opens the URL
+        # in a new focused tab in the existing window (most reliable approach)
+        try:
+            subprocess.Popen(["firefox", url])
+            time.sleep(3.5)   # wait for tab to open and page to start loading
+            # Focus Firefox so subsequent screenshot/find_on_screen sees it
+            for selector in ("class:firefox", "firefox"):
+                try:
+                    subprocess.run(
+                        ["hyprctl", "dispatch", "focuswindow", selector],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    break
+                except Exception:
+                    pass
+            return f"Opened Firefox: {url}  (tab is now active)"
+        except FileNotFoundError:
+            pass
+
+        # Firefox not open — launch a new window
+        try:
+            subprocess.Popen(["firefox", "--new-window", url])
+            time.sleep(4.0)   # cold-start is slower
+            for selector in ("class:firefox", "firefox"):
+                try:
+                    subprocess.run(
+                        ["hyprctl", "dispatch", "focuswindow", selector],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    break
+                except Exception:
+                    pass
+            return f"Launched Firefox: {url}"
+        except FileNotFoundError:
+            pass
+        return f"Could not open URL: Firefox is not installed or not in PATH"
+
+    # ── type_text ─────────────────────────────────────────────────────────
+    elif action == "type_text":
+        text = str(args.get("text", ""))
+        if not text:
+            return "Error: 'text' parameter is required"
+        pre = _pre_snapshot()
+        out = _ydotool("type", "--", text)
+        if out != "ok":
+            return f"Type failed: {out}"
+        verify = _verify_action("type_text", pre)
+        return f"Text typed{verify}"
+
+    # ── press_key ─────────────────────────────────────────────────────────
+    elif action == "press_key":
+        key = str(args.get("key", "")).strip()
+        if not key:
+            return "Error: 'key' parameter is required"
+        pre = _pre_snapshot()
+        out = _ydotool("key", key)
+        if out != "ok":
+            return f"Key press failed: {out}"
+        verify = _verify_action("press_key", pre)
+        return f"Key pressed: {key}{verify}"
+
+    # ── screenshot ────────────────────────────────────────────────────────
+    elif action == "screenshot":
+        from tools import screenshot as ss
+        return ss.run_tool({"mode": "fullscreen"})
+
+    # ── click_element ─────────────────────────────────────────────────────
+    # Looks up a pre-saved pixel position in ui_positions.json.
+    # Much more reliable than OCR — no guessing, goes straight to the right spot.
+    # {"action": "click_element", "site": "youtube.com", "element": "search_bar"}
+    elif action == "click_element":
+        site    = str(args.get("site", "")).strip().lower()
+        element = str(args.get("element", "")).strip().lower()
+        if not site or not element:
+            return "Error: 'site' and 'element' are required"
+        ui_map = _load_map()
+        pos = ui_map.get(site, {}).get(element)
+        if not pos:
+            return (
+                f"No saved position for '{site}' → '{element}'. "
+                f"Move your mouse there and run: save_position site={site} element={element}"
+            )
+        cx, cy = int(pos["x"]), int(pos["y"])
+        note = pos.get("note", "")
+        pre = _pre_snapshot()
+        out = _ydotool("mousemove", "--absolute", "-x", str(cx), "-y", str(cy))
+        if out != "ok":
+            return f"Mouse move to ({cx},{cy}) failed: {out}"
+        time.sleep(0.25)
+        out = _ydotool("click", "0xC0")
+        if out != "ok":
+            return f"Click failed: {out}"
+        time.sleep(0.1)
+        verify = _verify_action("click_element", pre)
+        return f"Clicked '{element}' on {site} at ({cx}, {cy}){verify}" + (f"  [{note}]" if note else "")
+
+    # ── save_position ─────────────────────────────────────────────────────
+    # Reads current cursor pos via hyprctl and saves it to ui_positions.json.
+    # {"action": "save_position", "site": "youtube.com", "element": "search_bar"}
+    elif action == "save_position":
+        site    = str(args.get("site", "")).strip().lower()
+        element = str(args.get("element", "")).strip().lower()
+        note    = str(args.get("note", "")).strip()
+        if not site or not element:
+            return "Error: 'site' and 'element' are required"
+        try:
+            r = subprocess.run(
+                ["hyprctl", "cursorpos"],
+                capture_output=True, text=True, timeout=3
+            )
+            # output: "X, Y" e.g. "709, 122"
+            xy = r.stdout.strip().replace(" ", "")
+            x_str, y_str = xy.split(",")
+            cx, cy = int(x_str), int(y_str)
+        except Exception as e:
+            return f"Could not read cursor position: {e}"
+        ui_map = _load_map()
+        if site not in ui_map:
+            ui_map[site] = {}
+        ui_map[site][element] = {"x": cx, "y": cy, "note": note or element}
+        _save_map(ui_map)
+        return f"Saved: {site} → {element} = ({cx}, {cy})"
+
+    # ── list_positions ────────────────────────────────────────────────────
+    # Shows every saved position.
+    # {"action": "list_positions"}  or  {"action": "list_positions", "site": "youtube.com"}
+    elif action == "list_positions":
+        site_filter = str(args.get("site", "")).strip().lower()
+        ui_map = _load_map()
+        lines = []
+        for s, elements in ui_map.items():
+            if s.startswith("_"):
+                continue                # skip _note, _resolution meta keys
+            if site_filter and site_filter not in s:
+                continue
+            for el, pos in elements.items():
+                note = pos.get("note", "")
+                lines.append(f"  {s}  →  {el}  ({pos['x']}, {pos['y']})" +
+                              (f"  # {note}" if note else ""))
+        if not lines:
+            return "No positions saved yet. Use save_position to add entries."
+        return "Saved UI positions:\n" + "\n".join(lines)
+
+    # ── scan_screen ──────────────────────────────────────────────────────
+    # Build the structured element map: every visible UI element with bounding box.
+    # Uses YOLO ui_parser when model is available, falls back to OCR screen_map.
+    # {"action": "scan_screen"}  or  {"action": "scan_screen", "app": "firefox"}
+    elif action == "scan_screen":
+        from tools import ui_parser
+        app_hint = str(args.get("app", "firefox"))
+        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+        elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
+        return ui_parser.format_elements(elements)
+
+    # ── click_map ────────────────────────────────────────────────────────
+    # Find an element in the last scan_screen result and click its center.
+    # ALWAYS run scan_screen first, then click_map.
+    # Uses ui_parser.find_element which reads from the shared cache.
+    # {"action": "click_map", "text": "Search"}
+    elif action == "click_map":
+        text = str(args.get("text", "")).strip()
+        if not text:
+            return "Error: 'text' parameter is required"
+        from tools import ui_parser
+        el = ui_parser.find_element(text)
+        if not el:
+            return (
+                f"Element '{text}' not found in screen map. "
+                "Run scan_screen first to refresh the map."
+            )
+        cx, cy = el["cx"], el["cy"]
+        pre = _pre_snapshot()
+        out = _ydotool("mousemove", "--absolute", "-x", str(cx), "-y", str(cy))
+        if out != "ok":
+            return f"Mouse move to ({cx},{cy}) failed: {out}"
+        time.sleep(0.25)
+        out = _ydotool("click", "0xC0")
+        if out != "ok":
+            return f"Click failed: {out}"
+        time.sleep(0.1)
+        verify = _verify_action("click_map", pre)
+        return (
+            f"Clicked \"{el['text']}\" [{el.get('type','?')}] "
+            f"at ({cx}, {cy})  size {el['w']}×{el['h']}{verify}"
+        )
+
+    # ── smart_click ─────────────────────────────────────────────────────
+    # All-in-one: parse the screen (YOLO+OCR or OCR fallback), find the
+    # element, and click it. Combines scan_screen + click_map in one call.
+    # {"action": "smart_click", "text": "Search", "app": "firefox"}
+    elif action == "smart_click":
+        text = str(args.get("text", "")).strip()
+        if not text:
+            return "Error: 'text' parameter is required"
+        from tools import ui_parser
+        app_hint = str(args.get("app", "firefox"))
+        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+        elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
+        el = ui_parser.find_element(text, elements)
+        if not el:
+            return (
+                f"Element '{text}' not found on screen after parsing. "
+                f"Detected {len(elements)} elements total. "
+                "Try a different search term or take a screenshot to see what's visible."
+            )
+        cx, cy = el["cx"], el["cy"]
+        pre = _pre_snapshot()
+        out = _ydotool("mousemove", "--absolute", "-x", str(cx), "-y", str(cy))
+        if out != "ok":
+            return f"Mouse move to ({cx},{cy}) failed: {out}"
+        time.sleep(0.25)
+        out = _ydotool("click", "0xC0")
+        if out != "ok":
+            return f"Click failed: {out}"
+        time.sleep(0.1)
+        verify = _verify_action("smart_click", pre)
+        return (
+            f"Smart-clicked \"{el.get('text', '')}\" [{el.get('type','?')}] "
+            f"at ({cx}, {cy})  size {el['w']}×{el['h']}{verify}"
+        )
+
+    # ── type_into ───────────────────────────────────────────────────────
+    # Parse screen, find the element, click it, then type text into it.
+    # Combines smart_click + type_text for input fields.
+    # {"action": "type_into", "element": "Search", "text": "lofi music"}
+    elif action == "type_into":
+        element_query = str(args.get("element", "")).strip()
+        text = str(args.get("text", "")).strip()
+        if not element_query:
+            return "Error: 'element' parameter is required"
+        if not text:
+            return "Error: 'text' parameter is required"
+        from tools import ui_parser
+        app_hint = str(args.get("app", "firefox"))
+        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+        elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
+        el = ui_parser.find_element(element_query, elements)
+        if not el:
+            return (
+                f"Element '{element_query}' not found on screen. "
+                f"Detected {len(elements)} elements. "
+                "Try a different search term."
+            )
+        cx, cy = el["cx"], el["cy"]
+        # Click the field
+        pre = _pre_snapshot()
+        out = _ydotool("mousemove", "--absolute", "-x", str(cx), "-y", str(cy))
+        if out != "ok":
+            return f"Mouse move to ({cx},{cy}) failed: {out}"
+        time.sleep(0.25)
+        out = _ydotool("click", "0xC0")
+        if out != "ok":
+            return f"Click on element failed: {out}"
+        time.sleep(0.3)
+        # Type the text
+        out = _ydotool("type", "--", text)
+        if out != "ok":
+            return f"Typing failed: {out}"
+        verify = _verify_action("type_into", pre)
+        return (
+            f"Clicked \"{el.get('text', '')}\" [{el.get('type','?')}] "
+            f"at ({cx}, {cy}) and typed \"{text}\"{verify}"
+        )
+
+    else:
+        return (
+            f"Unknown action: '{action}'. "
+            "Available: scan_screen, click_map, smart_click, type_into, "
+            "click_element, save_position, list_positions, find_on_screen, "
+            "click_text, open_url, focus_window, type_text, press_key, screenshot"
+        )
+
+================================================================================
+FILE: ai-model/tools/ui_parser.py  [YOLO UI detection + targeted OCR]
+================================================================================
+# ========================= tools/ui_parser.py =========================
+"""
+UI Parser — YOLO-based GUI element detection + targeted OCR.
+
+Replaces the OCR-only screen_map pipeline with a detection-first
+approach: a YOLO model locates UI components (buttons, inputs, icons,
+menus, cards, lists), then tesseract runs OCR *only on detected boxes*
+for text recognition.
+
+Pipeline:
+  1. grim fullscreen capture
+  2. YOLO UI detection model → bounding boxes + class labels
+  3. tesseract OCR on each detected box → text content
+  4. merge into structured element list
+  5. cache to screen_map.json
+
+Fallback: if no YOLO model is available, delegates to the existing
+screen_map.scan() OCR-only pipeline so nothing breaks.
+
+Model setup:
+  Place a YOLOv8 .pt model trained on UI elements at the path
+  configured in config.UI_MODEL_PATH (default: ai-model/models/ui_detect.pt).
+  Or set the path in config/system_config.json under "ui_model_path".
+
+  Supported classes (configurable via _CLASS_MAP):
+    button, input, icon, menu, card, list, checkbox, radio,
+    dropdown, toggle, link, image, text, header, nav, search_bar
+
+Usage:
+  from tools import ui_parser
+  elements = ui_parser.parse_screen()
+  el = ui_parser.find_element("Search")
+  # el = {"type":"input", "text":"Search", "x":500, "y":110, "w":250, ...}
+"""
+
+import os
+import subprocess
+import json
+import time
+
+import config
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+_SCREENSHOT_PATH = os.path.join(config.SCREENSHOT_DIR, "_ui_parse.png")
+_MAP_CACHE = os.path.join(config.SCREENSHOT_DIR, "screen_map.json")
+
+# Model path: check config, fallback to default location
+_DEFAULT_MODEL_PATH = os.path.join(config.BASE_DIR, "models", "ui_detect.pt")
+UI_MODEL_PATH = getattr(config, 'UI_MODEL_PATH', _DEFAULT_MODEL_PATH)
+
+# ── YOLO model (lazy-loaded) ─────────────────────────────────────────────────
+
+_model = None
+_model_loaded = False  # distinguishes "not tried" from "tried and failed"
+
+
+def _load_model():
+    """Lazily load the YOLO model. Returns the model or None."""
+    global _model, _model_loaded
+    if _model_loaded:
+        return _model
+
+    _model_loaded = True
+
+    if not os.path.isfile(UI_MODEL_PATH):
+        print(f"[ui_parser] No UI model at {UI_MODEL_PATH} — using OCR fallback")
+        return None
+
+    try:
+        from ultralytics import YOLO
+        _model = YOLO(UI_MODEL_PATH)
+        # Warm up with a tiny dummy inference to load weights
+        import numpy as np
+        _dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+        _model.predict(_dummy, verbose=False)
+        print(f"[ui_parser] YOLO model loaded: {UI_MODEL_PATH}")
+    except ImportError:
+        print("[ui_parser] ultralytics not installed — pip install ultralytics")
+        _model = None
+    except Exception as e:
+        print(f"[ui_parser] Failed to load model: {e}")
+        _model = None
+
+    return _model
+
+
+def is_model_available() -> bool:
+    """Check if a YOLO model is loaded and ready."""
+    return _load_model() is not None
+
+
+# ── Class label mapping ──────────────────────────────────────────────────────
+# Maps YOLO class IDs to semantic type names.
+# This needs to match whatever classes the model was trained on.
+# Override by placing a class_map.json next to the model file.
+
+_DEFAULT_CLASS_MAP = {
+    0: "button",
+    1: "input",
+    2: "icon",
+    3: "menu",
+    4: "card",
+    5: "list",
+    6: "checkbox",
+    7: "radio",
+    8: "dropdown",
+    9: "toggle",
+    10: "link",
+    11: "image",
+    12: "text",
+    13: "header",
+    14: "nav",
+    15: "search_bar",
+}
+
+_class_map = None
+
+
+def _get_class_map() -> dict:
+    """Load class map, checking for a custom mapping file first."""
+    global _class_map
+    if _class_map is not None:
+        return _class_map
+
+    custom_path = os.path.join(os.path.dirname(UI_MODEL_PATH), "class_map.json")
+    if os.path.isfile(custom_path):
+        try:
+            with open(custom_path, 'r') as f:
+                raw = json.load(f)
+            # Convert string keys to int if needed
+            _class_map = {int(k): v for k, v in raw.items()}
+            return _class_map
+        except Exception:
+            pass
+
+    _class_map = _DEFAULT_CLASS_MAP
+    return _class_map
+
+
+# ── Screenshot capture ────────────────────────────────────────────────────────
+
+def _capture(path: str = None) -> bool:
+    """Capture fullscreen via grim. Returns True on success."""
+    if path is None:
+        path = _SCREENSHOT_PATH
+    try:
+        subprocess.run(["grim", path], check=True, capture_output=True, timeout=8)
+        return True
+    except Exception:
+        return False
+
+
+# ── OCR on a cropped region ──────────────────────────────────────────────────
+
+def _ocr_region(img_array, x: int, y: int, w: int, h: int) -> str:
+    """Run tesseract on a cropped region of the image. Returns text string."""
+    try:
+        from PIL import Image
+        import io
+
+        # Crop the region (img_array is a numpy array from cv2/PIL)
+        cropped = img_array[y:y+h, x:x+w]
+
+        # Convert numpy array to PNG bytes for tesseract stdin
+        pil_img = Image.fromarray(cropped)
+        buf = io.BytesIO()
+        pil_img.save(buf, format='PNG')
+        png_bytes = buf.getvalue()
+
+        # Run tesseract on stdin
+        result = subprocess.run(
+            ["tesseract", "stdin", "stdout", "--psm", "7", "-l", "eng"],
+            input=png_bytes, capture_output=True, timeout=5
+        )
+        text = result.stdout.decode('utf-8', errors='replace').strip()
+        # Clean control characters
+        text = ''.join(c for c in text if c.isprintable() or c in '\n\t')
+        return text.strip()
+    except Exception:
+        return ""
+
+
+def _ocr_fullscreen_tsv(png_path: str) -> str:
+    """Fallback: full-page tesseract TSV for when YOLO isn't available."""
+    try:
+        r = subprocess.run(
+            ["tesseract", png_path, "stdout", "--psm", "3", "tsv"],
+            capture_output=True, text=True, check=True, timeout=30
+        )
+        return r.stdout
+    except Exception:
+        return ""
+
+
+# ── YOLO detection ────────────────────────────────────────────────────────────
+
+def _detect(img_path: str, confidence: float = 0.25) -> list[dict]:
+    """Run YOLO detection on an image. Returns list of raw detections.
+
+    Each detection: {class_id, class_name, confidence, x, y, w, h}
+    """
+    model = _load_model()
+    if model is None:
+        return []
+
+    class_map = _get_class_map()
+
+    try:
+        results = model.predict(
+            img_path,
+            conf=confidence,
+            verbose=False,
+            device='cpu',   # safe default; change to 0 for GPU
+        )
+    except Exception as e:
+        print(f"[ui_parser] Detection error: {e}")
+        return []
+
+    detections = []
+    for result in results:
+        boxes = result.boxes
+        if boxes is None:
+            continue
+        for i in range(len(boxes)):
+            xyxy = boxes.xyxy[i].cpu().numpy()
+            cls_id = int(boxes.cls[i].cpu().numpy())
+            conf = float(boxes.conf[i].cpu().numpy())
+
+            x1, y1, x2, y2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
+            detections.append({
+                "class_id": cls_id,
+                "class_name": class_map.get(cls_id, f"class_{cls_id}"),
+                "confidence": round(conf, 3),
+                "x": x1,
+                "y": y1,
+                "w": x2 - x1,
+                "h": y2 - y1,
+            })
+
+    return detections
+
+
+# ── Full parse pipeline ──────────────────────────────────────────────────────
+
+def parse_screen(
+    min_x: int = 0, max_x: int = 99999,
+    min_y: int = 0, max_y: int = 99999,
+    confidence: float = 0.25,
+) -> list[dict]:
+    """Full pipeline: capture → detect → OCR → merge → cache.
+
+    Returns structured element list:
+      [{"type":"button", "text":"Submit", "x":100, "y":200, "w":80, "h":30,
+        "cx":140, "cy":215, "conf":0.92}, ...]
+
+    If YOLO model is not available, falls back to OCR-only pipeline
+    (screen_map.scan).
+    """
+    # Capture screenshot
+    if not _capture(_SCREENSHOT_PATH):
+        return []
+
+    model = _load_model()
+
+    if model is None:
+        # Fallback to OCR-only pipeline
+        from tools import screen_map
+        return screen_map.scan(min_x, max_x, min_y, max_y)
+
+    # Run YOLO detection
+    detections = _detect(_SCREENSHOT_PATH, confidence)
+
+    if not detections:
+        # No detections — fall back to OCR-only
+        from tools import screen_map
+        return screen_map.scan(min_x, max_x, min_y, max_y)
+
+    # Load image for cropped OCR
+    try:
+        import numpy as np
+        from PIL import Image
+        img = np.array(Image.open(_SCREENSHOT_PATH))
+    except ImportError:
+        print("[ui_parser] PIL not available — skipping per-box OCR")
+        img = None
+    except Exception as e:
+        print(f"[ui_parser] Image load error: {e}")
+        img = None
+
+    # Merge: for each detection, run OCR on the bounding box
+    elements = []
+    for det in detections:
+        cx = det["x"] + det["w"] // 2
+        cy = det["y"] + det["h"] // 2
+
+        # Filter to requested region
+        if not (min_x <= cx <= max_x and min_y <= cy <= max_y):
+            continue
+
+        # Run OCR on the detected bounding box
+        text = ""
+        if img is not None:
+            # Expand box slightly for better OCR (pad 4px each side)
+            pad = 4
+            ox = max(0, det["x"] - pad)
+            oy = max(0, det["y"] - pad)
+            ow = min(det["w"] + 2 * pad, img.shape[1] - ox)
+            oh = min(det["h"] + 2 * pad, img.shape[0] - oy)
+            text = _ocr_region(img, ox, oy, ow, oh)
+
+        elements.append({
+            "type": det["class_name"],
+            "text": text,
+            "x": det["x"],
+            "y": det["y"],
+            "w": det["w"],
+            "h": det["h"],
+            "cx": cx,
+            "cy": cy,
+            "conf": det["confidence"],
+        })
+
+    # Sort top-to-bottom, left-to-right
+    elements.sort(key=lambda e: (e["y"], e["x"]))
+
+    # Save to cache (same format as screen_map)
+    cache = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "yolo",
+        "count": len(elements),
+        "elements": elements,
+    }
+    try:
+        os.makedirs(os.path.dirname(_MAP_CACHE), exist_ok=True)
+        with open(_MAP_CACHE, "w") as f:
+            json.dump(cache, f, indent=2)
+    except Exception:
+        pass
+
+    return elements
+
+
+# ── Element search ────────────────────────────────────────────────────────────
+
+def find_element(query: str, elements: list[dict] = None) -> dict | None:
+    """Find an element by text or type. Loads from cache if elements is None.
+
+    Search priority:
+      1. Exact text match
+      2. Text substring match
+      3. Type match (e.g. query="input" matches type="input")
+      4. Fuzzy partial overlap
+    """
+    if elements is None:
+        try:
+            with open(_MAP_CACHE, "r") as f:
+                cache = json.load(f)
+                elements = cache.get("elements", [])
+        except Exception:
+            return None
+
+    q = query.strip().lower()
+    best = None
+    best_score = -1
+
+    for el in elements:
+        text = (el.get("text") or "").lower()
+        el_type = (el.get("type") or "").lower()
+
+        # Exact text match
+        if text == q:
+            return el
+
+        # Query in element text
+        if len(q) >= 2 and q in text:
+            score = 95 - abs(len(text) - len(q))
+        # Element text in query
+        elif len(q) >= 2 and len(text) >= 2 and text in q:
+            score = 85 - abs(len(text) - len(q))
+        # Type match
+        elif q == el_type:
+            score = 75
+        # Type partial match (e.g. "search" matches "search_bar")
+        elif len(q) >= 3 and q in el_type:
+            score = 70
+        else:
+            continue
+
+        if score > best_score:
+            best_score = score
+            best = el
+
+    return best
+
+
+def find_elements_by_type(element_type: str, elements: list[dict] = None) -> list[dict]:
+    """Return all elements of a specific type (e.g. "button", "input")."""
+    if elements is None:
+        try:
+            with open(_MAP_CACHE, "r") as f:
+                cache = json.load(f)
+                elements = cache.get("elements", [])
+        except Exception:
+            return []
+
+    t = element_type.strip().lower()
+    return [el for el in elements if (el.get("type") or "").lower() == t]
+
+
+# ── Formatting for agent context ─────────────────────────────────────────────
+
+def format_elements(elements: list[dict], max_items: int = 40) -> str:
+    """Format element list as a readable string for the AI planner."""
+    if not elements:
+        return "[UI Parse: no elements detected]"
+
+    # Check if elements came from YOLO or OCR fallback
+    try:
+        with open(_MAP_CACHE, "r") as f:
+            cache = json.load(f)
+            source = cache.get("source", "ocr")
+    except Exception:
+        source = "unknown"
+
+    lines = [f"[UI Parse ({source}): {len(elements)} elements]"]
+    for el in elements[:max_items]:
+        t = el.get("type", "?")
+        text = (el.get("text") or "")[:45]
+        conf = el.get("conf", 0)
+        lines.append(
+            f"  [{t:12s}]  \"{text}\"  "
+            f"at ({el['cx']}, {el['cy']})  "
+            f"size {el['w']}x{el['h']}  "
+            f"conf={conf:.2f}"
+        )
+    if len(elements) > max_items:
+        lines.append(f"  ... and {len(elements) - max_items} more")
+    return "\n".join(lines)
+
+
+# ── Tool interface (for registry) ─────────────────────────────────────────────
+
+def run_tool(args: dict = None) -> str:
+    """Tool dispatcher for ui_parser.
+
+    Actions:
+      parse         — Run full detection + OCR pipeline on current screen
+                      {"action": "parse"}
+                      {"action": "parse", "app": "firefox"}
+
+      find          — Find an element by text or type
+                      {"action": "find", "query": "Search"}
+
+      find_type     — Find all elements of a type
+                      {"action": "find_type", "type": "button"}
+
+      status        — Check if YOLO model is loaded
+                      {"action": "status"}
+    """
+    if args is None:
+        args = {}
+
+    action = str(args.get("action", "parse")).strip().lower()
+
+    if action == "parse":
+        app_hint = str(args.get("app", "")).strip()
+        confidence = float(args.get("confidence", 0.25))
+
+        if app_hint:
+            from tools.computer_use import _get_window_region
+            min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+        else:
+            min_x, max_x, min_y, max_y = 0, 99999, 0, 99999
+
+        elements = parse_screen(min_x, max_x, min_y, max_y, confidence)
+        return format_elements(elements)
+
+    elif action == "find":
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return "Error: 'query' parameter is required"
+        el = find_element(query)
+        if el:
+            return (
+                f"Found [{el['type']}] \"{el.get('text', '')}\" "
+                f"at ({el['cx']}, {el['cy']})  size {el['w']}x{el['h']}  "
+                f"conf={el.get('conf', 0):.2f}"
+            )
+        return f"Element '{query}' not found. Run parse first to refresh."
+
+    elif action == "find_type":
+        el_type = str(args.get("type", "")).strip()
+        if not el_type:
+            return "Error: 'type' parameter is required"
+        results = find_elements_by_type(el_type)
+        if not results:
+            return f"No elements of type '{el_type}' found."
+        lines = [f"Found {len(results)} '{el_type}' elements:"]
+        for el in results[:20]:
+            lines.append(
+                f"  \"{el.get('text', '')[:40]}\"  "
+                f"at ({el['cx']}, {el['cy']})  size {el['w']}x{el['h']}"
+            )
+        return "\n".join(lines)
+
+    elif action == "status":
+        available = is_model_available()
+        return (
+            f"UI Parser status:\n"
+            f"  Model path: {UI_MODEL_PATH}\n"
+            f"  Model loaded: {'YES' if available else 'NO (using OCR fallback)'}\n"
+            f"  Detection: {'YOLO' if available else 'tesseract OCR only'}"
+        )
+
+    else:
+        return (
+            f"Unknown action: '{action}'. "
+            "Available: parse, find, find_type, status"
+        )
+
+================================================================================
+FILE: ai-model/tools/screen_map.py  [OCR-only fallback element map]
+================================================================================
+# ========================= tools/screen_map.py =========================
+"""
+Screen Element Map — structured layout understanding from OCR.
+
+Instead of raw text, produces a list of UI elements with bounding boxes:
+
+  [
+    {"text": "Search",  "x": 820, "y": 85, "w": 600, "h": 36, "cx": 1120, "cy": 103, "type": "search_bar"},
+    {"text": "Sign in", "x": 1700, "y": 85, "w": 80, "h": 30, "cx": 1740, "cy": 100, "type": "button"},
+  ]
+
+The AI reads this map and reasons:
+    element = find("Search")
+    click(element["cx"], element["cy"])
+
+No coordinate guessing. No OCR re-runs. One scan → full spatial understanding.
+
+Pipeline:
+  1. grim fullscreen capture
+  2. tesseract --psm 3 tsv → per-word bounding boxes
+  3. Group adjacent words on the same line into elements
+  4. Classify each element (search_bar, button, nav, heading, text)
+  5. Save to cache/screen_map.json
+  6. Return the element list
+"""
+
+import os
+import subprocess
+import json
+import time
+
+import config
+
+_CU_PNG = os.path.join(config.SCREENSHOT_DIR, "_map_screen.png")
+_MAP_CACHE = os.path.join(config.SCREENSHOT_DIR, "screen_map.json")
+
+# ── Grouping thresholds ───────────────────────────────────────────────────────
+_LINE_Y_TOLERANCE = 12     # words within ±12px vertically = same line
+_WORD_GAP_MAX     = 40     # words separated by <40px horizontally = same element
+_MIN_CONF         = 30     # drop words below this OCR confidence
+
+
+def _capture() -> bool:
+    try:
+        subprocess.run(["grim", _CU_PNG], check=True, capture_output=True, timeout=8)
+        return True
+    except Exception:
+        return False
+
+
+def _ocr_tsv() -> str:
+    try:
+        r = subprocess.run(
+            ["tesseract", _CU_PNG, "stdout", "--psm", "3", "tsv"],
+            capture_output=True, text=True, check=True, timeout=30
+        )
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def _parse_words(tsv: str) -> list[dict]:
+    """Parse tesseract TSV into a list of word dicts with bounding boxes."""
+    words = []
+    for line in tsv.strip().split('\n')[1:]:
+        parts = line.split('\t')
+        if len(parts) < 12:
+            continue
+        try:
+            conf = float(parts[10])
+            text = parts[11].strip()
+        except (ValueError, IndexError):
+            continue
+        if conf < _MIN_CONF or not text:
+            continue
+        try:
+            x = int(parts[6])
+            y = int(parts[7])
+            w = int(parts[8])
+            h = int(parts[9])
+        except ValueError:
+            continue
+        if w < 2 or h < 2:
+            continue
+        words.append({
+            "text": text,
+            "x": x, "y": y, "w": w, "h": h,
+            "conf": conf,
+        })
+    return words
+
+
+def _group_into_elements(words: list[dict]) -> list[dict]:
+    """
+    Group adjacent words on the same line into single elements.
+    "Sign" + "in" (close together, same y) → "Sign in" with merged bounding box.
+    """
+    if not words:
+        return []
+
+    # Sort by y (top→bottom), then x (left→right)
+    words.sort(key=lambda w: (w["y"], w["x"]))
+
+    elements = []
+    current = None
+
+    for word in words:
+        if current is None:
+            current = {
+                "text": word["text"],
+                "x": word["x"], "y": word["y"],
+                "w": word["w"], "h": word["h"],
+                "conf": word["conf"],
+                "_words": [word],
+            }
+            continue
+
+        # Check if this word is on the same line and close enough to merge
+        same_line = abs(word["y"] - current["y"]) <= _LINE_Y_TOLERANCE
+        gap = word["x"] - (current["x"] + current["w"])
+
+        if same_line and 0 <= gap <= _WORD_GAP_MAX:
+            # Merge into current element
+            current["text"] += " " + word["text"]
+            new_right = word["x"] + word["w"]
+            new_bottom = max(current["y"] + current["h"], word["y"] + word["h"])
+            current["w"] = new_right - current["x"]
+            current["h"] = new_bottom - current["y"]
+            current["conf"] = min(current["conf"], word["conf"])
+            current["_words"].append(word)
+        else:
+            # Flush current element, start new one
+            elements.append(current)
+            current = {
+                "text": word["text"],
+                "x": word["x"], "y": word["y"],
+                "w": word["w"], "h": word["h"],
+                "conf": word["conf"],
+                "_words": [word],
+            }
+
+    if current:
+        elements.append(current)
+
+    # Add center coordinates and clean up
+    for el in elements:
+        el["cx"] = el["x"] + el["w"] // 2
+        el["cy"] = el["y"] + el["h"] // 2
+        del el["_words"]
+
+    return elements
+
+
+def _classify(element: dict) -> str:
+    """
+    Classify an element based on its size and text content.
+    Returns: search_bar | button | nav | heading | icon | text
+    """
+    text = element["text"].lower()
+    w = element["w"]
+    h = element["h"]
+
+    # Search bars: wide, contain "search"
+    if w > 200 and "search" in text:
+        return "search_bar"
+
+    # Navigation items at top of screen
+    if element["y"] < 80 and w < 200:
+        return "nav"
+
+    # Buttons: short text, small area
+    word_count = len(element["text"].split())
+    if word_count <= 3 and h < 50 and w < 180:
+        return "button"
+
+    # Headings: large height
+    if h > 30 and word_count <= 6:
+        return "heading"
+
+    # Icons: very small, 1-2 chars
+    if len(element["text"]) <= 2 and w < 40:
+        return "icon"
+
+    return "text"
+
+
+def scan(min_x=0, max_x=99999, min_y=0, max_y=99999) -> list[dict]:
+    """
+    Full pipeline: capture → OCR → group → classify → save.
+    Optional region bounds to restrict results (e.g. Firefox window only).
+    Returns the element list.
+    """
+    if not _capture():
+        return []
+
+    tsv = _ocr_tsv()
+    if not tsv:
+        return []
+
+    words = _parse_words(tsv)
+
+    # Filter to region
+    words = [w for w in words
+             if min_x <= w["x"] + w["w"]//2 <= max_x
+             and min_y <= w["y"] + w["h"]//2 <= max_y]
+
+    elements = _group_into_elements(words)
+
+    # Classify each element
+    for el in elements:
+        el["type"] = _classify(el)
+
+    # Save to cache
+    cache = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "count": len(elements),
+        "elements": elements,
+    }
+    try:
+        os.makedirs(os.path.dirname(_MAP_CACHE), exist_ok=True)
+        with open(_MAP_CACHE, "w") as f:
+            json.dump(cache, f, indent=2)
+    except Exception:
+        pass
+
+    return elements
+
+
+def find_element(query: str, elements: list[dict] = None) -> dict | None:
+    """
+    Find the best matching element by text.
+    Priority: exact match > substring > type match.
+    If elements is None, loads from cache.
+    """
+    if elements is None:
+        try:
+            with open(_MAP_CACHE, "r") as f:
+                cache = json.load(f)
+                elements = cache.get("elements", [])
+        except Exception:
+            return None
+
+    q = query.strip().lower()
+    best = None
+    best_score = -1
+
+    for el in elements:
+        text = el["text"].lower()
+
+        # Exact match
+        if text == q:
+            return el   # instant win
+
+        # Query is substring of element text (both must be ≥3 chars)
+        if len(q) >= 3 and len(text) >= 3 and q in text:
+            score = 90 - abs(len(text) - len(q))
+        # Element text is substring of query (both must be ≥3 chars)
+        elif len(q) >= 3 and len(text) >= 3 and text in q:
+            score = 80 - abs(len(text) - len(q))
+        # Type match (e.g. query="search_bar" matches type)
+        elif q == el.get("type", ""):
+            score = 70
+        else:
+            continue
+
+        if score > best_score:
+            best_score = score
+            best = el
+
+    return best
+
+
+def format_map(elements: list[dict], max_items: int = 30) -> str:
+    """Format element list as a readable string for the AI context."""
+    if not elements:
+        return "[Screen map: no elements detected]"
+
+    lines = [f"[Screen map: {len(elements)} elements]"]
+    for el in elements[:max_items]:
+        t = el.get("type", "?")
+        lines.append(
+            f"  [{t:10s}]  \"{el['text'][:50]}\"  "
+            f"at ({el['cx']}, {el['cy']})  "
+            f"size {el['w']}×{el['h']}  "
+            f"conf={el.get('conf', 0):.0f}"
+        )
+    if len(elements) > max_items:
+        lines.append(f"  ... and {len(elements) - max_items} more")
+    return "\n".join(lines)
+
+================================================================================
+FILE: ai-model/tools/actions.py  [low-level ydotool mouse/keyboard]
+================================================================================
+# ========================= tools/actions.py =========================
+"""
+Mouse/keyboard automation via ydotool (Wayland-native).
+
+Supported actions (pass via args dict):
+  mouse_move  : {"action": "mouse_move", "x": int, "y": int}
+  mouse_click : {"action": "mouse_click", "button": "left"|"right"|"middle"}
+  type_text   : {"action": "type_text", "text": str}
+  press_key   : {"action": "press_key", "key": str}  e.g. "ctrl+c", "Return"
+  scroll      : {"action": "scroll", "direction": "up"|"down", "amount": int}
+
+NOTE: Risky tool — requires WhatsApp confirmation before execution.
+      ydotool must be running: sudo ydotoold
+"""
+import subprocess
+
+_BUTTON_CODES = {
+    'left':   '0xC0',   # 0x40 (press) | 0x80 (release) = click
+    'right':  '0xC1',
+    'middle': '0xC2',
+}
+
+
+def _run(cmd: list) -> str:
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    if result.returncode == 0:
+        return "ok"
+    return result.stderr.strip() or "unknown error"
+
+
+def run_tool(args=None):
+    if args is None:
+        args = {}
+
+    action = args.get('action', '')
+
+    try:
+        if action == 'mouse_move':
+            x = int(args.get('x', 0))
+            y = int(args.get('y', 0))
+            out = _run(['ydotool', 'mousemove', '--absolute', '-x', str(x), '-y', str(y)])
+            return f"Mouse moved to ({x}, {y})" if out == "ok" else f"Error: {out}"
+
+        elif action == 'mouse_click':
+            btn = args.get('button', 'left')
+            code = _BUTTON_CODES.get(btn, _BUTTON_CODES['left'])
+            out = _run(['ydotool', 'click', code])
+            return f"Clicked {btn}" if out == "ok" else f"Error: {out}"
+
+        elif action == 'type_text':
+            text = args.get('text', '')
+            if not text:
+                return "Error: no text provided"
+            out = _run(['ydotool', 'type', '--', text])
+            return "Text typed" if out == "ok" else f"Error: {out}"
+
+        elif action == 'press_key':
+            key = args.get('key', '')
+            if not key:
+                return "Error: no key provided"
+            out = _run(['ydotool', 'key', key])
+            return f"Key pressed: {key}" if out == "ok" else f"Error: {out}"
+
+        elif action == 'scroll':
+            direction = args.get('direction', 'down')
+            amount = int(args.get('amount', 3))
+            # Positive y = scroll down, negative y = scroll up
+            delta = amount if direction == 'down' else -amount
+            out = _run(['ydotool', 'scroll', '--', f'0:{delta * 120}'])
+            return f"Scrolled {direction} x{amount}" if out == "ok" else f"Error: {out}"
+
+        else:
+            return (
+                f"Unknown action: '{action}'. "
+                "Available: mouse_move, mouse_click, type_text, press_key, scroll"
+            )
+
+    except FileNotFoundError:
+        return "Error: ydotool not found. Install: sudo pacman -S ydotool / ensure ydotoold is running"
+    except subprocess.TimeoutExpired:
+        return "Error: ydotool command timed out"
+    except Exception as e:
+        return f"Error in actions tool: {str(e)}"
+
+================================================================================
+FILE: ai-model/tools/window_manager.py  [hyprctl window control]
+================================================================================
+# ========================= tools/window_manager.py =========================
+"""
+Hyprland window management via hyprctl.
+
+Supported actions (pass via args dict):
+  list_windows   : {}  → returns list of open windows
+  focus_window   : {"app": str}  → focus window matching class/title
+  launch_app     : {"app": str}  → launch an application
+  close_window   : {"app": str (optional)}  → close active or named window
+  get_active     : {}  → get info about the currently focused window
+
+This is a SAFE tool — no confirmation required.
+Use this BEFORE resorting to mouse automation.
+"""
+import json
+import subprocess
+
+
+def _run(cmd: list, timeout: int = 5) -> tuple[int, str, str]:
+    """Run a subprocess command. Returns (returncode, stdout, stderr)."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return -1, "", "Command timed out"
+    except FileNotFoundError:
+        return -1, "", f"Command not found: {cmd[0]}"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def _list_windows() -> str:
+    code, out, err = _run(["hyprctl", "-j", "clients"])
+    if code != 0:
+        return f"Error listing windows: {err}"
+    try:
+        clients = json.loads(out)
+        if not clients:
+            return "No open windows found."
+        lines = []
+        for c in clients:
+            title = c.get("title", "").strip()
+            wm_class = c.get("class", "").strip()
+            workspace = c.get("workspace", {}).get("name", "?")
+            lines.append(f"  [{wm_class}] {title}  (workspace: {workspace})")
+        return f"Open windows ({len(lines)}):\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error parsing window list: {e}"
+
+
+def _focus_window(app: str) -> str:
+    if not app:
+        return "Error: 'app' argument is required for focus_window"
+    # hyprctl dispatch focuswindow accepts class name or title
+    code, out, err = _run(["hyprctl", "dispatch", "focuswindow", app])
+    if code == 0:
+        return f"Focused window: {app}"
+    # Try title match as fallback
+    code2, out2, err2 = _run(["hyprctl", "dispatch", "focuswindow", f"title:{app}"])
+    if code2 == 0:
+        return f"Focused window by title: {app}"
+    return f"Could not focus '{app}': {err or err2}"
+
+
+def _launch_app(app: str) -> str:
+    if not app:
+        return "Error: 'app' argument is required for launch_app"
+    code, out, err = _run(["hyprctl", "dispatch", "exec", app])
+    if code == 0:
+        return f"Launched: {app}"
+    return f"Error launching '{app}': {err}"
+
+
+def _close_window(app: str = "") -> str:
+    if app:
+        # Focus first, then close
+        _focus_window(app)
+    code, out, err = _run(["hyprctl", "dispatch", "closewindow", "active"])
+    if code == 0:
+        return f"Closed window{f': {app}' if app else ' (active)'}"
+    # Fallback — killactive
+    code2, out2, err2 = _run(["hyprctl", "dispatch", "killactive"])
+    if code2 == 0:
+        return f"Closed active window"
+    return f"Error closing window: {err or err2}"
+
+
+def _get_active() -> str:
+    code, out, err = _run(["hyprctl", "-j", "activewindow"])
+    if code != 0:
+        return f"Error getting active window: {err}"
+    try:
+        data = json.loads(out)
+        title = data.get("title", "unknown")
+        wm_class = data.get("class", "unknown")
+        at = data.get("at", [0, 0])
+        size = data.get("size", [0, 0])
+        workspace = data.get("workspace", {}).get("name", "?")
+        return (
+            f"Active window:\n"
+            f"  Class    : {wm_class}\n"
+            f"  Title    : {title}\n"
+            f"  Position : {at[0]},{at[1]}\n"
+            f"  Size     : {size[0]}x{size[1]}\n"
+            f"  Workspace: {workspace}"
+        )
+    except Exception as e:
+        return f"Error parsing active window: {e}"
+
+
+def run_tool(args=None):
+    """
+    Window management for Hyprland.
+
+    Args:
+        args (dict): Must contain 'action'. Extra keys depend on action.
+
+    Returns:
+        str: Result string.
+    """
+    if args is None:
+        args = {}
+
+    action = args.get("action", "")
+
+    try:
+        if action == "list_windows":
+            return _list_windows()
+
+        elif action == "focus_window":
+            return _focus_window(args.get("app", ""))
+
+        elif action == "launch_app":
+            return _launch_app(args.get("app", ""))
+
+        elif action == "close_window":
+            return _close_window(args.get("app", ""))
+
+        elif action == "get_active":
+            return _get_active()
+
+        else:
+            return (
+                f"Unknown action: '{action}'. "
+                "Available: list_windows, focus_window, launch_app, close_window, get_active"
+            )
+
+    except Exception as e:
+        return f"Error in window_manager tool: {str(e)}"
+
+================================================================================
+FILE: ai-model/tools/browser_control.py  [Playwright DOM-based web automation]
+================================================================================
+# ========================= tools/browser_control.py =========================
+"""
+Browser automation via Playwright — Layer 1 (DOM control).
+
+This is the most reliable way to interact with websites.
+Uses the browser's own DOM instead of OCR/coordinate guessing.
+
+Actions:
+  open          Navigate to a URL (launches browser if needed)
+                {"action": "open", "url": "https://youtube.com"}
+
+  click         Click an element by CSS selector or text content
+                {"action": "click", "selector": "input[name='search_query']"}
+                {"action": "click", "text": "Sign in"}
+
+  type          Type text into a focused element or a specific selector
+                {"action": "type", "selector": "input[name='search_query']", "text": "coconut oil"}
+                {"action": "type", "text": "coconut oil"}  ← types into currently focused element
+
+  press         Press a keyboard key
+                {"action": "press", "key": "Enter"}
+
+  get_text      Get visible text from the page or a specific element
+                {"action": "get_text"}
+                {"action": "get_text", "selector": "#results"}
+
+  get_elements  List interactive elements on the page (forms, buttons, links, inputs)
+                {"action": "get_elements"}
+                {"action": "get_elements", "filter": "input"}
+
+  screenshot    Take a screenshot of the current page
+                {"action": "screenshot"}
+
+  scroll        Scroll the page
+                {"action": "scroll", "direction": "down"}
+                {"action": "scroll", "direction": "up", "amount": 500}
+
+  wait          Wait for an element to appear
+                {"action": "wait", "selector": "#search-results", "timeout": 10}
+
+  close         Close the browser
+                {"action": "close"}
+
+  eval_js       Run JavaScript on the page (advanced)
+                {"action": "eval_js", "script": "document.title"}
+
+Typical workflow for "search YouTube for coconut oil":
+  1. open         url=https://youtube.com
+  2. click        selector=input[name='search_query']
+  3. type         text=coconut oil
+  4. press        key=Enter
+  5. get_text     selector=#contents   ← read search results
+
+Design:
+  - Single persistent browser instance (reused across calls)
+  - Headless=False so the user sees the browser on screen
+  - Firefox (Playwright-managed)
+  - Falls through to computer_use.py (OCR layer) for desktop apps
+"""
+
+import os
+import json
+import time
+import threading
+
+import config
+
+_SCREENSHOT_PATH = os.path.join(config.SCREENSHOT_DIR, "_browser.png")
+
+# ── Persistent browser state (singleton) ────────────────────────────────────
+
+_lock = threading.Lock()
+_playwright = None
+_browser = None
+_context = None
+_page = None
+
+
+def _ensure_browser():
+    """Launch browser if not already running. Returns the active page."""
+    global _playwright, _browser, _context, _page
+
+    with _lock:
+        # Already running and page is still open
+        if _page is not None:
+            try:
+                _ = _page.url  # quick health check
+                return _page
+            except Exception:
+                # Page or browser died — restart
+                _cleanup_unlocked()
+
+        from playwright.sync_api import sync_playwright
+
+        _playwright = sync_playwright().start()
+        _browser = _playwright.firefox.launch(
+            headless=False,
+        )
+        _context = _browser.new_context(
+            viewport={"width": 1280, "height": 900},
+        )
+        _page = _context.new_page()
+        return _page
+
+
+def _cleanup_unlocked():
+    """Internal cleanup (caller must hold _lock)."""
+    global _playwright, _browser, _context, _page
+    try:
+        if _page:
+            _page.close()
+    except Exception:
+        pass
+    try:
+        if _context:
+            _context.close()
+    except Exception:
+        pass
+    try:
+        if _browser:
+            _browser.close()
+    except Exception:
+        pass
+    try:
+        if _playwright:
+            _playwright.stop()
+    except Exception:
+        pass
+    _playwright = _browser = _context = _page = None
+
+
+def _close_browser():
+    """Public close — acquires lock."""
+    with _lock:
+        _cleanup_unlocked()
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _find_by_text(page, text: str, click: bool = False):
+    """
+    Find an element by visible text. Tries multiple strategies:
+    1. getByText (Playwright built-in)
+    2. getByRole with name
+    3. CSS contains-text selectors
+    """
+    strategies = [
+        lambda: page.get_by_text(text, exact=False).first,
+        lambda: page.get_by_role("button", name=text).first,
+        lambda: page.get_by_role("link", name=text).first,
+        lambda: page.get_by_placeholder(text).first,
+        lambda: page.get_by_label(text).first,
+    ]
+    for strategy in strategies:
+        try:
+            el = strategy()
+            if el.is_visible(timeout=2000):
+                if click:
+                    el.click(timeout=5000)
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def _safe_selector(page, selector: str, timeout: int = 5000):
+    """Wait for selector and return the element, or None."""
+    try:
+        page.wait_for_selector(selector, timeout=timeout)
+        return page.query_selector(selector)
+    except Exception:
+        return None
+
+
+# ── Public tool dispatcher ───────────────────────────────────────────────────
+
+def run_tool(args: dict = None) -> str:
+    if args is None:
+        args = {}
+
+    action = str(args.get("action", "")).strip().lower()
+
+    # ── open ─────────────────────────────────────────────────────────────
+    if action == "open":
+        url = str(args.get("url", "")).strip()
+        if not url:
+            return "Error: 'url' parameter is required"
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        try:
+            page = _ensure_browser()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # Extra wait for dynamic sites like YouTube
+            time.sleep(1)
+            return f"Opened: {page.url}  (title: {page.title()})"
+        except Exception as e:
+            return f"Error opening {url}: {e}"
+
+    # ── click ────────────────────────────────────────────────────────────
+    elif action == "click":
+        selector = str(args.get("selector", "")).strip()
+        text = str(args.get("text", "")).strip()
+        if not selector and not text:
+            return "Error: 'selector' or 'text' parameter is required"
+
+        try:
+            page = _ensure_browser()
+
+            if selector:
+                el = _safe_selector(page, selector)
+                if el:
+                    el.click()
+                    return f"Clicked: {selector}"
+                # Fallback: try text match
+                if not text:
+                    return f"Element not found: {selector}"
+
+            if text:
+                el = _find_by_text(page, text, click=True)
+                if el:
+                    return f"Clicked element with text: '{text}'"
+                return f"No visible element found with text: '{text}'"
+        except Exception as e:
+            return f"Click error: {e}"
+
+    # ── type ─────────────────────────────────────────────────────────────
+    elif action == "type":
+        text = str(args.get("text", ""))
+        selector = str(args.get("selector", "")).strip()
+        clear = args.get("clear", True)
+
+        if not text:
+            return "Error: 'text' parameter is required"
+
+        try:
+            page = _ensure_browser()
+
+            if selector:
+                el = _safe_selector(page, selector)
+                if not el:
+                    return f"Element not found: {selector}"
+                if clear:
+                    el.fill("")
+                el.fill(text)
+                return f"Typed into {selector}: '{text}'"
+            else:
+                # Type into currently focused element
+                page.keyboard.type(text, delay=50)
+                return f"Typed: '{text}'"
+        except Exception as e:
+            return f"Type error: {e}"
+
+    # ── press ────────────────────────────────────────────────────────────
+    elif action == "press":
+        key = str(args.get("key", "")).strip()
+        if not key:
+            return "Error: 'key' parameter is required"
+        try:
+            page = _ensure_browser()
+            page.keyboard.press(key)
+            return f"Pressed: {key}"
+        except Exception as e:
+            return f"Press error: {e}"
+
+    # ── get_text ─────────────────────────────────────────────────────────
+    elif action == "get_text":
+        selector = str(args.get("selector", "")).strip()
+        max_len = int(args.get("max_length", 3000))
+
+        try:
+            page = _ensure_browser()
+            if selector:
+                el = _safe_selector(page, selector, timeout=5000)
+                if not el:
+                    return f"Element not found: {selector}"
+                txt = el.inner_text()
+            else:
+                txt = page.inner_text("body")
+
+            if len(txt) > max_len:
+                txt = txt[:max_len] + f"\n... (truncated, {len(txt)} chars total)"
+            return txt.strip() or "(empty)"
+        except Exception as e:
+            return f"get_text error: {e}"
+
+    # ── get_elements ─────────────────────────────────────────────────────
+    elif action == "get_elements":
+        filter_type = str(args.get("filter", "")).strip().lower()
+        max_items = int(args.get("max", 40))
+
+        try:
+            page = _ensure_browser()
+            # Build a selector for interactive elements
+            selectors = {
+                "input": "input:visible, textarea:visible",
+                "button": "button:visible, [role='button']:visible, input[type='submit']:visible",
+                "link": "a[href]:visible",
+                "form": "form:visible",
+            }
+
+            if filter_type and filter_type in selectors:
+                css = selectors[filter_type]
+            else:
+                css = "a[href]:visible, button:visible, input:visible, textarea:visible, select:visible, [role='button']:visible"
+
+            elements = page.query_selector_all(css)
+            lines = []
+            for i, el in enumerate(elements[:max_items]):
+                tag = el.evaluate("e => e.tagName.toLowerCase()")
+                etype = el.get_attribute("type") or ""
+                name = el.get_attribute("name") or ""
+                placeholder = el.get_attribute("placeholder") or ""
+                aria = el.get_attribute("aria-label") or ""
+                href = el.get_attribute("href") or ""
+                text = (el.inner_text() or "").strip()[:60]
+
+                desc_parts = [f"<{tag}"]
+                if etype:
+                    desc_parts.append(f' type="{etype}"')
+                if name:
+                    desc_parts.append(f' name="{name}"')
+                if placeholder:
+                    desc_parts.append(f' placeholder="{placeholder}"')
+                if aria:
+                    desc_parts.append(f' aria-label="{aria}"')
+                if href:
+                    short_href = href[:80] + ("..." if len(href) > 80 else "")
+                    desc_parts.append(f' href="{short_href}"')
+                desc_parts.append(">")
+                if text:
+                    desc_parts.append(f" {text}")
+
+                lines.append(f"  {i+1}. {''.join(desc_parts)}")
+
+            total = len(elements)
+            header = f"[{total} interactive elements"
+            if total > max_items:
+                header += f", showing first {max_items}"
+            header += "]"
+            return header + "\n" + "\n".join(lines) if lines else "No interactive elements found"
+        except Exception as e:
+            return f"get_elements error: {e}"
+
+    # ── screenshot ───────────────────────────────────────────────────────
+    elif action == "screenshot":
+        try:
+            page = _ensure_browser()
+            page.screenshot(path=_SCREENSHOT_PATH, full_page=False)
+            title = page.title()
+            url = page.url
+            return f"Screenshot saved: {_SCREENSHOT_PATH}\nPage: {title}\nURL: {url}"
+        except Exception as e:
+            return f"Screenshot error: {e}"
+
+    # ── scroll ───────────────────────────────────────────────────────────
+    elif action == "scroll":
+        direction = str(args.get("direction", "down")).strip().lower()
+        amount = int(args.get("amount", 400))
+        try:
+            page = _ensure_browser()
+            delta = amount if direction == "down" else -amount
+            page.mouse.wheel(0, delta)
+            time.sleep(0.3)
+            return f"Scrolled {direction} by {amount}px"
+        except Exception as e:
+            return f"Scroll error: {e}"
+
+    # ── wait ─────────────────────────────────────────────────────────────
+    elif action == "wait":
+        selector = str(args.get("selector", "")).strip()
+        timeout = int(args.get("timeout", 10)) * 1000
+        if not selector:
+            return "Error: 'selector' parameter is required"
+        try:
+            page = _ensure_browser()
+            page.wait_for_selector(selector, timeout=timeout)
+            return f"Element appeared: {selector}"
+        except Exception as e:
+            return f"Timeout waiting for '{selector}': {e}"
+
+    # ── close ────────────────────────────────────────────────────────────
+    elif action == "close":
+        _close_browser()
+        return "Browser closed"
+
+    # ── eval_js ──────────────────────────────────────────────────────────
+    elif action == "eval_js":
+        script = str(args.get("script", "")).strip()
+        if not script:
+            return "Error: 'script' parameter is required"
+        try:
+            page = _ensure_browser()
+            result = page.evaluate(script)
+            return str(result)
+        except Exception as e:
+            return f"JS eval error: {e}"
+
+    else:
+        return (
+            f"Unknown action: '{action}'. "
+            "Available: open, click, type, press, get_text, get_elements, "
+            "screenshot, scroll, wait, close, eval_js"
+        )
+
+================================================================================
+FILE: ai-model/tools/ui_positions.json  [pre-saved pixel positions]
+================================================================================
+{
+  "_note": "Pixel positions calibrated for 1920x1200 with Firefox nearly fullscreen. Run save_position to update any entry.",
+  "_resolution": "1920x1200",
+
+  "youtube.com": {
+    "search_bar":     {"x": 709,  "y": 122, "note": "search input box (centre)"},
+    "search_button":  {"x": 1093, "y": 122, "note": "magnifying glass button"}
+  },
+
+  "google.com": {
+    "search_bar":     {"x": 960,  "y": 430, "note": "main search input"},
+    "search_button":  {"x": 960,  "y": 510, "note": "Google Search button"}
+  },
+
+  "firefox": {
+    "address_bar":    {"x": 736,  "y": 45,  "note": "URL / address bar"},
+    "new_tab_button": {"x": 1870, "y": 20,  "note": "+ new tab button"}
+  },
+
+  "vscode": {
+    "terminal":       {"x": 960,  "y": 950, "note": "integrated terminal area"},
+    "editor":         {"x": 960,  "y": 500, "note": "main editor area"}
+  }
+}
+
+================================================================================
+END OF 4/10 — Computer Control (perception + action)
+================================================================================

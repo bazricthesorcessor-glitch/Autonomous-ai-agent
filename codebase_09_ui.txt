@@ -1,0 +1,2313 @@
+================================================================================
+PROJECT: AVRIL — Personal Advanced AI Assistant
+PART: 9/10 — Frontend UI (ui/)
+================================================================================
+Owner / Pen name: Divyansh (Bazric)
+AI Name: Avril (Satomi)
+Stack: Python (Flask + Ollama) backend | Node.js (Baileys) WhatsApp bot | Vanilla JS UI
+Exported: 2026-03-13 21:54:22
+Section: Vanilla JS control panel: index.html, css/style.css, js/api.js, chat.js, settings.js, sidebar.js
+================================================================================
+
+ARCHITECTURE:
+  User (Browser)
+      |
+  [ui/index.html]  <-- standalone dark-theme control panel (served at /app)
+      | fetch() via api.js
+      |
+  User (WhatsApp)
+      |
+  [whatsapp-ai-bot/server.js  :3000]  <-- index.html (Web Setup UI)
+      | axios POST /chat
+      |
+  [ai-model/core/api_server.py  :8000]  <-- main.py entry
+      |
+      +-- core/agent_loop.py        (2-tier fast path + plan-tool-respond loop)
+      +-- core/brain.py             (model routing + fallback)
+      +-- core/context_builder.py   (memory assembly, raw log truncation, screen cache)
+      +-- core/state.py             (agentic state machine)
+      +-- core/system_shortcuts.py  (Hyprland shortcuts for planner awareness)
+      +-- core/autonomous_mode.py   (global flag — enable/disable background tasks)
+      +-- engines/fact_engine.py    (structured facts — extracted BEFORE context build)
+      +-- engines/task_manager.py   (multi-task persistent tracking)
+      +-- engines/memory_engine.py  (vector search + add_memory)
+      +-- engines/janitor.py        (maintenance / summarizer trigger)
+      +-- engines/summarizer.py     (log summarization)
+      +-- engines/goal_scheduler.py (daemon thread — fires scheduled goals silently)
+      +-- engines/todo_manager.py   (CRUD for memory/todos.json)
+      +-- tools/registry.py         (tool loader + safe/risky gate + TOOL CATEGORIES)
+      +-- tools/files.py
+      +-- tools/screenshot.py       (active-window OCR, noise-filtered, writes screen_cache)
+      +-- tools/system_diagnostics.py
+      +-- tools/actions.py          (ydotool mouse/keyboard — individual low-level moves)
+      +-- tools/computer_use.py     (scan_screen, click_map, smart_click, type_into, open_url)
+      +-- tools/ui_parser.py        (YOLO UI detection + targeted OCR — replaces OCR-only)
+      +-- tools/screen_map.py       (structured element map: OCR fallback pipeline)
+      +-- tools/browser_control.py  (Playwright DOM-based web automation — Layer 1)
+      +-- tools/ui_positions.json   (pre-saved pixel positions per site/app)
+      +-- tools/window_manager.py   (hyprctl window/app control)
+      +-- tools/terminal_safe.py    (allowlisted safe shell execution)
+      +-- tools/todos.py            (agent tool — create/update/list/clear todos)
+      +-- tools/utilities.py        (flip_coin, roll_dice, time_now, convert_units, etc.)
+      +-- tools/skill_builder.py    (AI skill creation with USER APPROVAL GATE)
+      +-- tools/code.py             (sandboxed Python exec/eval — restricted builtins)
+      +-- tools/skills/             (AI-created skill files, auto-loaded on startup)
+      +-- tools/web/                (web tools package)
+      |     __init__.py, http_client.py, browser.py, search.py, fetch.py, wikipedia.py, inspect.py
+      +-- tools/pdf.py              (PDF read, info, topics, page extraction, keyword search)
+      +-- tools/google/             (Google Apps package — OAuth2)
+      |     __init__.py, auth.py, drive.py, calendar.py, classroom.py, gmail.py
+      +-- personality/              (persona prompts: default, coding, teacher, assistant)
+      +-- memory/                   (tasks.json, facts.json, todos.json, identity.json, goals.json, etc.)
+      +-- helpers/                  (start.sh, stop.sh, status.sh, engineering_brief.py)
+      +-- models/                   (UI detection model: ui_detect.pt)
+
+  API:  /chat  /health  /tasks  /status  /logs  /persona  /screen
+        /autonomous  /todos  /todos/<id>  /todos/clear-done  /tool-feed
+        /debug-screen  /ui-parse  /skills  /skills/<name>/approve|reject
+  UI:   http://localhost:8000/app  (new full control panel)
+        http://localhost:8000/ui   (legacy inline text console)
+  Principles:
+    - UI communicates only through HTTP — never imports AI code directly
+    - CORS enabled so ui/ can also be opened as a plain file://
+    - Skills require user approval before activation
+    - UI parser uses YOLO detection when model available, OCR fallback otherwise
+
+================================================================================
+FILE: ui/index.html
+================================================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Avril — local AI assistant" />
+  <!-- Base URL: all relative paths (css/, js/) resolve under /app/ -->
+  <base href="/app/" />
+  <!-- PWA / desktop-app ready: no server-side rendering, pure client JS -->
+  <title>Avril</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────────────────── -->
+<div id="header">
+  <div class="header-left">
+    <span id="header-dot" class="dot dot-unknown" title="connecting…"></span>
+    <span class="header-title">AVRIL</span>
+  </div>
+  <div class="header-right">
+    <button id="auto-btn" class="auto-btn-on" title="Autonomous tasks: ON (click to toggle)">⬢ AUTO</button>
+    <button id="menu-btn" title="Settings">&#8942;</button>
+  </div>
+</div>
+
+<!-- ── App shell ───────────────────────────────────────────────────────── -->
+<div id="app">
+
+  <!-- Chat panel -->
+  <div id="chat-panel">
+
+    <!-- Message history -->
+    <div id="messages"></div>
+
+    <!-- Thinking indicator -->
+    <div id="thinking-bar">
+      <div class="thinking-dots">
+        <span></span><span></span><span></span>
+      </div>
+      Avril is thinking&hellip;
+    </div>
+
+    <!-- Input bar -->
+    <div id="input-bar">
+      <button id="new-chat-btn" title="New chat">+</button>
+      <input
+        id="msg-input"
+        type="text"
+        placeholder="Message Avril&hellip;  (type /help for commands)"
+        autocomplete="off"
+        spellcheck="false"
+        autofocus
+      />
+      <button id="send-btn">Send</button>
+    </div>
+
+  </div><!-- /chat-panel -->
+
+</div><!-- /app -->
+
+<!-- ── Overlay (closes settings panel) ────────────────────────────────── -->
+<div id="overlay"></div>
+
+<!-- ── Settings panel (populated by sidebar.js) ───────────────────────── -->
+<div id="settings-panel"></div>
+
+<!-- ── JS modules (order matters: api → settings → chat → sidebar) ─────── -->
+<script src="js/api.js"></script>
+<script src="js/settings.js"></script>
+<script src="js/chat.js"></script>
+<script src="js/sidebar.js"></script>
+
+<script>
+  // Bootstrap
+  Settings.load();
+  Chat.init();
+  Sidebar.init();
+</script>
+
+</body>
+</html>
+
+================================================================================
+FILE: ui/css/style.css
+================================================================================
+/* ============================================================
+   Avril UI — Dark terminal theme
+   ============================================================ */
+
+/* === Reset === */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* === Design tokens === */
+:root {
+  --bg:           #111111;
+  --surface:      #1e1e1e;
+  --surface2:     #252525;
+  --surface3:     #2c2c2c;
+  --border:       #2e2e2e;
+  --accent:       #4a9eff;
+  --accent-dim:   #1a3050;
+  --accent-hover: #254d73;
+  --text:         #d0d0d0;
+  --text-sub:     #999999;
+  --text-muted:   #666666;
+  --text-dim:     #444444;
+  --user-bg:      #172233;
+  --user-border:  #4a9eff;
+  --avril-bg:     #1e1e1e;
+  --avril-border: #555555;
+  --system-bg:    #161616;
+  --danger:       #e86c3a;
+  --success:      #6ec97a;
+  --warn:         #e8c47a;
+  --font:         'Courier New', Courier, monospace;
+  --radius:       4px;
+  --panel-w:      75%;
+  --header-h:     44px;
+}
+
+/* === Base === */
+html, body {
+  height: 100%;
+}
+
+body {
+  background:  var(--bg);
+  color:       var(--text);
+  font-family: var(--font);
+  font-size:   13px;
+  overflow:    hidden;
+  height:      100vh;
+  display:     flex;
+  flex-direction: column;
+}
+
+/* ================================================================
+   HEADER
+================================================================ */
+#header {
+  background:    var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding:       0 16px;
+  height:        var(--header-h);
+  display:       flex;
+  align-items:   center;
+  justify-content: space-between;
+  flex-shrink:   0;
+  user-select:   none;
+  z-index:       10;
+}
+
+.header-left {
+  display:     flex;
+  align-items: center;
+  gap:         10px;
+}
+
+.header-title {
+  font-size:      15px;
+  font-weight:    bold;
+  color:          var(--accent);
+  letter-spacing: 1.5px;
+}
+
+/* Online/offline dot */
+.dot {
+  width:         8px;
+  height:        8px;
+  border-radius: 50%;
+  display:       inline-block;
+  flex-shrink:   0;
+}
+.dot-online  { background: var(--success); box-shadow: 0 0 5px var(--success); }
+.dot-offline { background: var(--danger);  box-shadow: 0 0 5px var(--danger);  }
+.dot-unknown { background: var(--text-dim); }
+
+.header-right {
+  display:     flex;
+  align-items: center;
+  gap:         6px;
+}
+
+/* Three-dot menu button */
+#menu-btn {
+  background:   none;
+  border:       none;
+  color:        var(--text-muted);
+  font-size:    22px;
+  line-height:  1;
+  cursor:       pointer;
+  padding:      2px 8px;
+  border-radius: var(--radius);
+  transition:   color 0.15s, background 0.15s;
+  user-select:  none;
+}
+#menu-btn:hover {
+  color:      var(--text);
+  background: var(--surface2);
+}
+
+/* ================================================================
+   APP SHELL
+================================================================ */
+#app {
+  flex:             1;
+  display:          flex;
+  flex-direction:   column;
+  overflow:         hidden;
+  position:         relative;
+}
+
+/* ================================================================
+   CHAT PANEL
+================================================================ */
+#chat-panel {
+  flex:           1;
+  display:        flex;
+  flex-direction: column;
+  overflow:       hidden;
+}
+
+/* Messages scroll area */
+#messages {
+  flex:           1;
+  overflow-y:     auto;
+  padding:        18px 22px;
+  display:        flex;
+  flex-direction: column;
+  gap:            12px;
+  scroll-behavior: smooth;
+}
+
+#messages::-webkit-scrollbar       { width: 5px; }
+#messages::-webkit-scrollbar-track { background: transparent; }
+#messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
+
+/* ----------------------------------------------------------------
+   Message bubbles
+---------------------------------------------------------------- */
+.msg {
+  display:        flex;
+  flex-direction: column;
+  max-width:      78%;
+  animation:      fadeIn 0.14s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+
+.msg-user   { align-self: flex-end;   }
+.msg-avril  { align-self: flex-start; }
+.msg-system { align-self: center; max-width: 90%; }
+
+/* Meta line (sender + timestamp) */
+.msg-meta {
+  display:    flex;
+  align-items: baseline;
+  gap:        8px;
+  margin-bottom: 3px;
+}
+
+.msg-sender {
+  font-size:      10px;
+  font-weight:    bold;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.msg-user  .msg-sender { color: var(--accent); }
+.msg-avril .msg-sender { color: var(--text-muted); }
+
+.msg-time {
+  font-size: 9px;
+  color:     var(--text-dim);
+}
+
+/* Bubble body */
+.msg-body {
+  padding:      9px 13px;
+  border-radius: var(--radius);
+  line-height:  1.65;
+  white-space:  pre-wrap;
+  word-break:   break-word;
+}
+
+.msg-user .msg-body {
+  background:  var(--user-bg);
+  border-left: 3px solid var(--user-border);
+  color:       #c8deff;
+}
+
+.msg-avril .msg-body {
+  background:  var(--avril-bg);
+  border-left: 3px solid var(--avril-border);
+  color:       var(--text);
+}
+
+.msg-system .msg-body {
+  background:  var(--system-bg);
+  border:      1px solid var(--border);
+  color:       var(--text-muted);
+  font-size:   11px;
+  font-style:  italic;
+  text-align:  center;
+}
+
+/* ── Markdown styles inside Avril messages ─────────────────── */
+.msg-avril .msg-body code {
+  background:    #0d0d0d;
+  border:        1px solid var(--border);
+  padding:       1px 5px;
+  border-radius: 3px;
+  font-family:   var(--font);
+  font-size:     12px;
+  color:         #b5e4a0;
+}
+
+.msg-avril .msg-body pre {
+  background:    #0d0d0d;
+  border:        1px solid var(--border);
+  padding:       10px 12px;
+  border-radius: var(--radius);
+  overflow-x:    auto;
+  margin:        6px 0;
+  white-space:   pre;
+}
+
+.msg-avril .msg-body pre code {
+  background: none;
+  border:     none;
+  padding:    0;
+  color:      #b8c8dd;
+}
+
+.msg-avril .msg-body pre::-webkit-scrollbar       { height: 4px; }
+.msg-avril .msg-body pre::-webkit-scrollbar-thumb { background: var(--border); }
+
+.msg-avril .msg-body strong { color: var(--warn);  font-weight: bold; }
+.msg-avril .msg-body em     { color: var(--text-sub); font-style: italic; }
+
+.msg-avril .msg-body ul {
+  padding-left: 18px;
+  margin:       4px 0;
+}
+.msg-avril .msg-body li { margin-bottom: 3px; }
+
+/* Copy button */
+.msg-actions {
+  display:         flex;
+  justify-content: flex-end;
+  margin-top:      3px;
+}
+
+.copy-btn {
+  background:    none;
+  border:        none;
+  color:         var(--text-dim);
+  font-family:   var(--font);
+  font-size:     10px;
+  cursor:        pointer;
+  padding:       1px 6px;
+  border-radius: 2px;
+  transition:    color 0.15s;
+}
+.copy-btn:hover { color: var(--text-sub); }
+
+/* ================================================================
+   THINKING INDICATOR
+================================================================ */
+#thinking-bar {
+  display:     none;    /* shown via JS as 'flex' */
+  align-items: center;
+  gap:         8px;
+  padding:     6px 22px;
+  color:       var(--text-muted);
+  font-size:   11px;
+  font-style:  italic;
+  flex-shrink: 0;
+}
+
+.thinking-dots {
+  display: flex;
+  gap:     4px;
+}
+.thinking-dots span {
+  width:         5px;
+  height:        5px;
+  border-radius: 50%;
+  background:    var(--text-muted);
+  animation:     blink 1.2s infinite;
+}
+.thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes blink {
+  0%, 80%, 100% { opacity: 0.15; }
+  40%           { opacity: 1;    }
+}
+
+/* ================================================================
+   INPUT BAR
+================================================================ */
+#input-bar {
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+  padding:     10px 16px;
+  border-top:  1px solid var(--border);
+  flex-shrink: 0;
+  background:  var(--bg);
+}
+
+/* New-chat "+" button */
+#new-chat-btn {
+  background:   var(--surface);
+  border:       1px solid var(--border);
+  color:        var(--text-muted);
+  font-family:  var(--font);
+  font-size:    18px;
+  width:        34px;
+  height:       34px;
+  cursor:       pointer;
+  border-radius: var(--radius);
+  display:      flex;
+  align-items:  center;
+  justify-content: center;
+  flex-shrink:  0;
+  transition:   color 0.15s, border-color 0.15s;
+  line-height:  1;
+  user-select:  none;
+}
+#new-chat-btn:hover {
+  color:        var(--text);
+  border-color: var(--text-muted);
+}
+
+/* Text input */
+#msg-input {
+  flex:          1;
+  background:    var(--surface);
+  border:        1px solid var(--border);
+  color:         var(--text);
+  padding:       8px 12px;
+  font-family:   var(--font);
+  font-size:     13px;
+  border-radius: var(--radius);
+  outline:       none;
+  transition:    border-color 0.15s;
+}
+#msg-input:focus       { border-color: var(--accent); }
+#msg-input::placeholder { color: var(--text-dim); }
+
+/* Send button */
+#send-btn {
+  background:    var(--accent-dim);
+  border:        1px solid var(--accent);
+  color:         var(--accent);
+  padding:       8px 18px;
+  font-family:   var(--font);
+  font-size:     13px;
+  cursor:        pointer;
+  border-radius: var(--radius);
+  flex-shrink:   0;
+  transition:    background 0.15s;
+  user-select:   none;
+}
+#send-btn:hover:not(:disabled) { background: var(--accent-hover); }
+#send-btn:disabled { opacity: 0.35; cursor: default; }
+
+/* ================================================================
+   OVERLAY (closes settings panel when clicking outside)
+================================================================ */
+#overlay {
+  position:       fixed;
+  inset:          0;
+  background:     rgba(0, 0, 0, 0.55);
+  opacity:        0;
+  pointer-events: none;
+  transition:     opacity 0.25s ease;
+  z-index:        99;
+}
+#overlay.active {
+  opacity:        1;
+  pointer-events: all;
+}
+
+/* ================================================================
+   SETTINGS PANEL (slides in from right)
+================================================================ */
+#settings-panel {
+  position:   fixed;
+  top:        0;
+  right:      0;
+  height:     100%;
+  width:      var(--panel-w);
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+
+  /* Start fully off-screen to the right */
+  transform:  translateX(100%);
+  transition: transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  z-index:   100;
+  display:   flex;
+  flex-direction: column;
+  overflow:  hidden;
+}
+
+/* Snap to view when .open is added */
+#settings-panel.open {
+  transform: translateX(0);
+}
+
+/* ── Panel header ── */
+.panel-header {
+  display:        flex;
+  justify-content: space-between;
+  align-items:    center;
+  padding:        13px 18px;
+  border-bottom:  1px solid var(--border);
+  flex-shrink:    0;
+  font-size:      14px;
+  color:          var(--text);
+  letter-spacing: 0.5px;
+  user-select:    none;
+}
+
+.close-btn {
+  background:    none;
+  border:        none;
+  color:         var(--text-muted);
+  font-size:     16px;
+  cursor:        pointer;
+  padding:       2px 6px;
+  border-radius: var(--radius);
+  line-height:   1;
+  transition:    color 0.15s;
+}
+.close-btn:hover { color: var(--text); }
+
+/* ── Panel body (scrollable) ── */
+.panel-body {
+  flex:       1;
+  overflow-y: auto;
+  padding:    0;
+}
+
+.panel-body::-webkit-scrollbar       { width: 4px; }
+.panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* ── Sections ── */
+.settings-section {
+  padding:       14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-section:last-child { border-bottom: none; }
+
+.settings-section h3 {
+  font-size:      10px;
+  text-transform: uppercase;
+  letter-spacing: 1.3px;
+  color:          var(--text-muted);
+  margin-bottom:  10px;
+}
+
+.hint {
+  font-size:  10px;
+  color:      var(--text-dim);
+  margin-top: 6px;
+  font-style: italic;
+  line-height: 1.5;
+}
+.hint.muted { color: var(--text-dim); }
+
+/* ── Mode buttons ── */
+.mode-buttons {
+  display:   flex;
+  flex-wrap: wrap;
+  gap:       6px;
+}
+
+.mode-btn {
+  background:    var(--surface2);
+  border:        1px solid var(--border);
+  color:         var(--text-muted);
+  font-family:   var(--font);
+  font-size:     12px;
+  padding:       5px 13px;
+  border-radius: var(--radius);
+  cursor:        pointer;
+  transition:    all 0.15s;
+}
+.mode-btn:hover       { border-color: var(--accent); color: var(--text); }
+.mode-btn.active      { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+
+/* ── Toggle switch ── */
+.toggle-row {
+  margin-bottom: 10px;
+}
+
+.toggle-label {
+  display:        flex;
+  align-items:    center;
+  justify-content: space-between;
+  cursor:         pointer;
+  user-select:    none;
+  font-size:      12px;
+  color:          var(--text);
+  gap:            10px;
+}
+
+.toggle-label input[type="checkbox"] { display: none; }
+
+.toggle-switch {
+  position:      relative;
+  width:         36px;
+  height:        20px;
+  background:    var(--surface3);
+  border:        1px solid var(--border);
+  border-radius: 10px;
+  flex-shrink:   0;
+  transition:    background 0.2s, border-color 0.2s;
+}
+
+.toggle-switch::after {
+  content:       '';
+  position:      absolute;
+  top:           2px;
+  left:          2px;
+  width:         14px;
+  height:        14px;
+  background:    var(--text-dim);
+  border-radius: 50%;
+  transition:    transform 0.2s, background 0.2s;
+}
+
+.toggle-label input:checked + .toggle-switch {
+  background:   var(--accent-dim);
+  border-color: var(--accent);
+}
+.toggle-label input:checked + .toggle-switch::after {
+  transform:  translateX(16px);
+  background: var(--accent);
+}
+
+/* ── Extra-prompt textarea ── */
+textarea {
+  width:          100%;
+  background:     var(--surface2);
+  border:         1px solid var(--border);
+  color:          var(--text);
+  padding:        8px 10px;
+  font-family:    var(--font);
+  font-size:      12px;
+  resize:         vertical;
+  border-radius:  var(--radius);
+  outline:        none;
+  transition:     border-color 0.15s;
+  line-height:    1.5;
+}
+textarea:focus       { border-color: var(--accent); }
+textarea::placeholder { color: var(--text-dim); }
+
+/* ── Screen OCR output ── */
+.screen-pre {
+  background:  #0a0a0a;
+  border:      1px solid var(--border);
+  padding:     8px 10px;
+  border-radius: var(--radius);
+  font-size:   10px;
+  color:       var(--text-muted);
+  max-height:  160px;
+  overflow-y:  auto;
+  white-space: pre-wrap;
+  word-break:  break-all;
+  line-height: 1.4;
+}
+
+/* ── Mini status rows ── */
+.mini-stat {
+  display:       flex;
+  gap:           8px;
+  margin-bottom: 4px;
+  font-size:     11px;
+  align-items:   baseline;
+}
+.sl { color: var(--text-dim); width: 48px; flex-shrink: 0; }
+.sv { color: var(--success); }
+
+/* ================================================================
+   FORM-ASSIST BANNER  (Active Avril detection)
+================================================================ */
+.form-assist-banner {
+  position:     fixed;
+  bottom:       70px;
+  left:         50%;
+  transform:    translateX(-50%);
+  background:   var(--surface);
+  border:       1px solid var(--accent);
+  padding:      10px 16px;
+  border-radius: var(--radius);
+  display:      flex;
+  align-items:  center;
+  gap:          10px;
+  z-index:      200;
+  font-size:    12px;
+  color:        var(--text);
+  box-shadow:   0 4px 24px rgba(0, 0, 0, 0.6);
+  animation:    fadeIn 0.2s ease;
+  white-space:  nowrap;
+}
+
+.form-assist-banner button {
+  background:    var(--surface2);
+  border:        1px solid var(--border);
+  color:         var(--text);
+  font-family:   var(--font);
+  font-size:     11px;
+  padding:       4px 12px;
+  cursor:        pointer;
+  border-radius: var(--radius);
+  transition:    border-color 0.15s;
+}
+.form-assist-banner button:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ================================================================
+   RESPONSIVE — narrow screens (mobile)
+================================================================ */
+@media (max-width: 600px) {
+  :root { --panel-w: 100%; }
+  .msg { max-width: 95%; }
+  #messages { padding: 12px 14px; }
+}
+
+/* ================================================================
+   TASK VIEWER + TOOL ACTIVITY FEED  (sidebar sections)
+================================================================ */
+
+/* Shared scroll container */
+.feed-list {
+  display:        flex;
+  flex-direction: column;
+  gap:            6px;
+  max-height:     220px;
+  overflow-y:     auto;
+}
+
+.feed-empty {
+  color:       var(--text-dim);
+  font-style:  italic;
+  font-size:   11px;
+}
+
+/* ── Task Viewer ── */
+.task-card {
+  background:    var(--surface2);
+  border-left:   3px solid #e08c4a;
+  border-radius: 2px;
+  padding:       6px 8px;
+  font-size:     11px;
+  line-height:   1.5;
+}
+
+.task-card-title {
+  color:       var(--text);
+  font-weight: 600;
+  word-break:  break-word;
+}
+
+.task-card-meta {
+  color:     var(--text-dim);
+  font-size: 10px;
+  margin-top: 2px;
+}
+
+/* ── Tool Feed ── */
+.feed-item {
+  background:    var(--surface2);
+  border-left:   3px solid var(--border);
+  border-radius: 2px;
+  padding:       5px 8px;
+  font-size:     10px;
+  line-height:   1.5;
+}
+
+.feed-item-error {
+  border-left-color: #c0392b;
+}
+
+.feed-item-header {
+  display:         flex;
+  justify-content: space-between;
+  gap:             4px;
+  align-items:     baseline;
+}
+
+.feed-tool {
+  color:       var(--accent);
+  font-weight: 600;
+  font-size:   11px;
+}
+
+.feed-ts {
+  color:     var(--text-dim);
+  font-size: 10px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.feed-result {
+  color:      var(--text-dim);
+  margin-top: 2px;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* ================================================================
+   CODE BLOCK WRAPPER  (per-block copy button)
+================================================================ */
+.code-block {
+  position: relative;
+  margin:   6px 0;
+}
+
+/* Override the margin on bare <pre> since .code-block handles spacing */
+.code-block pre {
+  margin: 0;
+}
+
+.code-copy-btn {
+  position:      absolute;
+  top:           5px;
+  right:         7px;
+  background:    transparent;
+  border:        1px solid var(--border);
+  color:         var(--text-dim);
+  font-family:   var(--font);
+  font-size:     9px;
+  padding:       1px 7px;
+  border-radius: 2px;
+  cursor:        pointer;
+  transition:    color 0.15s, border-color 0.15s;
+  line-height:   1.6;
+  user-select:   none;
+}
+
+.code-copy-btn:hover {
+  color:        var(--accent);
+  border-color: var(--accent);
+}
+
+/* ================================================================
+   MARKDOWN TABLES
+================================================================ */
+.msg-avril .msg-body .md-table {
+  border-collapse: collapse;
+  margin:          6px 0;
+  font-size:       11px;
+  max-width:       100%;
+  overflow-x:      auto;
+  display:         block;
+}
+
+.msg-avril .msg-body .md-table th,
+.msg-avril .msg-body .md-table td {
+  border:      1px solid var(--border);
+  padding:     4px 10px;
+  text-align:  left;
+  white-space: nowrap;
+}
+
+.msg-avril .msg-body .md-table th {
+  background:  var(--surface2);
+  color:       var(--accent);
+  font-weight: bold;
+}
+
+.msg-avril .msg-body .md-table tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* ================================================================
+   AUTONOMOUS MODE BUTTON  (#auto-btn in header)
+================================================================ */
+#auto-btn {
+  background:     transparent;
+  border:         1px solid var(--border);
+  color:          var(--text-dim);
+  font-family:    var(--font);
+  font-size:      9px;
+  padding:        2px 9px;
+  border-radius:  2px;
+  cursor:         pointer;
+  letter-spacing: 0.08em;
+  transition:     color 0.2s, border-color 0.2s, background 0.2s;
+  margin-right:   6px;
+  user-select:    none;
+}
+
+#auto-btn.auto-btn-on {
+  color:        #3dac6e;
+  border-color: #3dac6e;
+}
+
+#auto-btn.auto-btn-off {
+  color:        var(--text-dim);
+  border-color: var(--border);
+  opacity:      0.55;
+}
+
+/* Autonomous toggle switch in panel — green accent */
+.toggle-row-auto .toggle-switch-auto::before {
+  background: var(--text-dim);
+}
+input:checked + .toggle-switch-auto::before {
+  background:   #3dac6e;
+  transform:    translateX(16px);
+}
+input:checked ~ .toggle-switch-auto,
+input:checked + .toggle-switch-auto {
+  background: rgba(61, 172, 110, 0.25);
+}
+
+/* Hint-style small button */
+.hint-btn {
+  background:    transparent;
+  border:        1px solid var(--border);
+  color:         var(--text-dim);
+  font-family:   var(--font);
+  font-size:     10px;
+  padding:       2px 8px;
+  border-radius: 2px;
+  cursor:        pointer;
+  transition:    color 0.15s, border-color 0.15s;
+}
+.hint-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+/* ================================================================
+   TODO CARD  (inline in chat, rendered from __TODOS__ blocks)
+================================================================ */
+.todo-card {
+  border:        1px solid var(--border);
+  border-radius: 6px;
+  margin:        8px 0;
+  overflow:      hidden;
+  background:    var(--surface2);
+  max-width:     420px;
+}
+
+.todo-card-header {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  padding:         7px 12px 6px;
+  border-bottom:   1px solid var(--border);
+  background:      rgba(255,255,255,0.03);
+}
+
+.todo-card-title {
+  font-size:      11px;
+  font-weight:    bold;
+  color:          var(--accent);
+  letter-spacing: 0.04em;
+}
+
+.todo-card-count {
+  font-size:  10px;
+  color:      var(--text-dim);
+  font-family: var(--font);
+}
+
+.todo-items {
+  display:        flex;
+  flex-direction: column;
+  padding:        4px 0;
+}
+
+.todo-item {
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+  padding:     5px 12px;
+  transition:  background 0.15s;
+}
+
+.todo-item:hover { background: rgba(255,255,255,0.03); }
+
+.todo-item input[type="checkbox"] {
+  cursor:     pointer;
+  accent-color: var(--accent);
+  width:      13px;
+  height:     13px;
+  flex-shrink: 0;
+}
+
+.todo-content {
+  font-size:   12px;
+  line-height: 1.4;
+  color:       var(--text);
+}
+
+.todo-done .todo-content {
+  text-decoration: line-through;
+  color:           var(--text-dim);
+}
+
+.todo-progress .todo-content {
+  color: var(--accent);
+}
+
+/* ================================================================
+   SIDEBAR TODOS  (compact list in settings panel)
+================================================================ */
+.stodo-item {
+  display:      flex;
+  align-items:  center;
+  gap:          7px;
+  padding:      4px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  cursor:       default;
+}
+.stodo-item:last-child { border-bottom: none; }
+
+.stodo-item input[type="checkbox"] {
+  cursor:      pointer;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+
+.stodo-text {
+  font-size:   11px;
+  color:       var(--text);
+  line-height: 1.4;
+}
+
+.stodo-done .stodo-text {
+  text-decoration: line-through;
+  color:           var(--text-dim);
+}
+
+.stodo-progress .stodo-text {
+  color: var(--accent);
+}
+
+================================================================================
+FILE: ui/js/api.js
+================================================================================
+/**
+ * api.js — Network abstraction layer.
+ * All fetch() calls live here. UI components never call fetch() directly.
+ */
+
+const API_BASE = window.location.origin;
+
+const API = (() => {
+  async function _post(path, body) {
+    const res = await fetch(API_BASE + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async function _get(path, params = {}) {
+    const url = new URL(API_BASE + path);
+    Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  /**
+   * Send a chat message.
+   * @param {string} message
+   * @returns {Promise<{response: string}>}
+   */
+  async function sendMessage(message) {
+    return _post('/chat', { message });
+  }
+
+  /**
+   * Get system status (CPU, RAM, Disk, models).
+   * @returns {Promise<object>}
+   */
+  async function getStatus() {
+    return _get('/status');
+  }
+
+  /**
+   * Get all active tasks.
+   * @returns {Promise<{tasks: Array, count: number}>}
+   */
+  async function getTasks() {
+    return _get('/tasks');
+  }
+
+  /**
+   * Get conversation log lines.
+   * @param {number} lines
+   * @returns {Promise<{log: string, lines: number}>}
+   */
+  async function getLogs(lines = 100) {
+    return _get('/logs', { lines });
+  }
+
+  /**
+   * Set active persona mode. Backend respects locked flag.
+   * @param {string} mode  — 'default' | 'coding' | 'teacher' | 'assistant'
+   * @param {boolean} locked — prevent auto-switching
+   * @returns {Promise<{mode: string, locked: boolean}>}
+   */
+  async function setPersona(mode, locked = false) {
+    return _post('/persona', { mode, locked });
+  }
+
+  /**
+   * Get latest screen OCR cache.
+   * @returns {Promise<{text: string, timestamp: string, mode: string}>}
+   */
+  async function getScreen() {
+    return _get('/screen');
+  }
+
+  /**
+   * Get recent tool activity feed.
+   * @param {number} limit
+   * @returns {Promise<{feed: Array, count: number}>}
+   */
+  async function getToolFeed(limit = 15) {
+    return _get('/tool-feed', { limit });
+  }
+
+  /**
+   * Health check.
+   * @returns {Promise<{status: string, model: string}>}
+   */
+  async function getHealth() {
+    return _get('/health');
+  }
+
+  /**
+   * Get autonomous mode state.
+   * @returns {Promise<{enabled: boolean}>}
+   */
+  async function getAutonomous() {
+    return _get('/autonomous');
+  }
+
+  /**
+   * Enable or disable autonomous background tasks.
+   * @param {boolean} enabled
+   * @returns {Promise<{enabled: boolean, status: string}>}
+   */
+  async function setAutonomous(enabled) {
+    return _post('/autonomous', { enabled });
+  }
+
+  /**
+   * Get all todos.
+   * @returns {Promise<{todos: Array, count: number}>}
+   */
+  async function getTodos() {
+    return _get('/todos');
+  }
+
+  /**
+   * Update a todo item's status.
+   * @param {string} id
+   * @param {string} status  'pending' | 'in_progress' | 'done'
+   */
+  async function updateTodo(id, status) {
+    const res = await fetch(`${API_BASE}/todos/${encodeURIComponent(id)}`, {
+      method:  'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ status }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  return { sendMessage, getStatus, getTasks, getLogs, setPersona, getScreen, getHealth,
+           getToolFeed, getAutonomous, setAutonomous, getTodos, updateTodo };
+})();
+
+================================================================================
+FILE: ui/js/chat.js
+================================================================================
+/**
+ * chat.js — Chat panel: rendering, slash commands, send, new chat.
+ * Depends on: api.js, settings.js
+ */
+
+const Chat = (() => {
+  let _msgsEl   = null;
+  let _inputEl  = null;
+  let _sendBtn  = null;
+  let _thinkEl  = null;
+  let _busy     = false;
+
+  const _STORAGE_KEY    = 'avril_chat_history';
+  const _MAX_HISTORY    = 200;   // Cap to avoid filling localStorage
+  const _MAX_MSG_STORE  = 4000;  // Truncate individual messages at this length
+  let   _history        = [];    // [{role, text, ts}]
+
+  // ── Persistence ────────────────────────────────────────────────────────────
+
+  function _saveHistory() {
+    try {
+      localStorage.setItem(_STORAGE_KEY, JSON.stringify(_history));
+    } catch (e) {
+      // Storage full — trim and retry once
+      _history = _history.slice(-Math.floor(_MAX_HISTORY / 2));
+      try { localStorage.setItem(_STORAGE_KEY, JSON.stringify(_history)); } catch {}
+    }
+  }
+
+  function _loadHistory() {
+    try {
+      const raw = localStorage.getItem(_STORAGE_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (Array.isArray(saved)) {
+        saved.forEach(m => addMessage(m.role, m.text, m.ts, true /* replay */));
+      }
+    } catch {}
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  function _escHtml(s) {
+    return String(s)
+      .replace(/&/g,  '&amp;')
+      .replace(/</g,  '&lt;')
+      .replace(/>/g,  '&gt;')
+      .replace(/"/g,  '&quot;');
+  }
+
+  function _ts() {
+    return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  // ── Todo card renderer ─────────────────────────────────────────────────────
+
+  function _renderTodoCard(jsonStr) {
+    let items;
+    try { items = JSON.parse(jsonStr); } catch { return ''; }
+    if (!Array.isArray(items) || !items.length) return '';
+
+    const doneCount = items.filter(t => t.status === 'done').length;
+    const rows = items.map(t => {
+      const isDone    = t.status === 'done';
+      const isActive  = t.status === 'in_progress';
+      const cls       = isDone ? 'todo-done' : isActive ? 'todo-progress' : 'todo-pending';
+      const checked   = isDone ? 'checked' : '';
+      return `<div class="todo-item ${cls}" data-id="${_escHtml(t.id)}">` +
+             `<input type="checkbox" class="todo-cb" data-id="${_escHtml(t.id)}" ${checked}>` +
+             `<span class="todo-content">${_escHtml(t.content)}</span></div>`;
+    }).join('');
+
+    return `<div class="todo-card">` +
+           `<div class="todo-card-header">` +
+           `<span class="todo-card-title">Tasks</span>` +
+           `<span class="todo-card-count">${doneCount}/${items.length}</span></div>` +
+           `<div class="todo-items">${rows}</div></div>`;
+  }
+
+  // ── Markdown renderer (subset: code blocks, inline code, bold, italic) ─────
+
+  function _renderMarkdown(raw) {
+    if (!raw) return '';
+
+    // Extract __TODOS__ blocks FIRST (before _escHtml, which would corrupt JSON)
+    const _todoBlocks = [];
+    const _stripped   = raw.replace(/__TODOS__\n?([\s\S]*?)\n?__TODOS__/g, (_, json) => {
+      const idx = _todoBlocks.length;
+      _todoBlocks.push(json.trim());
+      return `___TD_${idx}___`;
+    });
+
+    // Escape HTML so injected tags are safe
+    let s = _escHtml(_stripped);
+
+    // Fenced code blocks: ```lang?\ncode\n```  — wrapped for copy-button support
+    s = s.replace(/```[^\n]*\n?([\s\S]*?)```/g,
+      (_, code) => `<div class="code-block"><pre><code>${code.trimEnd()}</code></pre><button class="code-copy-btn" title="Copy code">copy</button></div>`);
+
+    // Inline code: `code`
+    s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+
+    // Bold: **text**
+    s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+    // Italic: *text*  — uses only lookahead (no lookbehind — avoids Safari/old Chrome bugs)
+    s = s.replace(/\*(?!\*)([^*\n]+?)\*(?!\*)/g, '<em>$1</em>');
+
+    // Markdown tables: | col | col | rows
+    s = s.replace(/((?:\|[^\n]+\|\s*\n?){2,})/g, (block) => {
+      const rows = block.trim().split('\n').filter(r => r.trim());
+      const isSep = r => /^\| *[-:| ]+\|$/.test(r.trim());
+      const toCell = (r, tag) =>
+        r.split('|').slice(1, -1).map(c => `<${tag}>${c.trim()}</${tag}>`).join('');
+      let html = '<table class="md-table">';
+      if (rows.length >= 2 && isSep(rows[1])) {
+        html += `<thead><tr>${toCell(rows[0], 'th')}</tr></thead><tbody>`;
+        for (let i = 2; i < rows.length; i++) {
+          if (!isSep(rows[i])) html += `<tr>${toCell(rows[i], 'td')}</tr>`;
+        }
+        html += '</tbody>';
+      } else {
+        html += '<tbody>';
+        for (const r of rows) {
+          if (!isSep(r)) html += `<tr>${toCell(r, 'td')}</tr>`;
+        }
+        html += '</tbody>';
+      }
+      return html + '</table>';
+    });
+
+    // Bullet lists: lines starting with "- "
+    s = s.replace(/((?:^- .+\n?)+)/gm, (block) => {
+      const items = block.trim().split('\n').map(l => `<li>${l.slice(2)}</li>`).join('');
+      return `<ul>${items}</ul>`;
+    });
+
+    // Line breaks (preserve newlines outside block elements)
+    s = s.replace(/\n(?!<\/(ul|pre|li))/g, '<br>');
+
+    // Restore todo cards (placeholders were set before escaping)
+    if (_todoBlocks.length) {
+      _todoBlocks.forEach((json, idx) => {
+        s = s.replace(`___TD_${idx}___`, _renderTodoCard(json));
+      });
+    }
+
+    return s;
+  }
+
+  // ── Message rendering ──────────────────────────────────────────────────────
+
+  function addMessage(role, text, timestamp, replay = false) {
+    const ts  = timestamp || _ts();
+    const div = document.createElement('div');
+    div.className = `msg msg-${role}`;
+
+    if (role !== 'system') {
+      const meta   = document.createElement('div');
+      meta.className = 'msg-meta';
+
+      const sender = document.createElement('span');
+      sender.className = 'msg-sender';
+      sender.textContent = role === 'user' ? 'You' : 'Avril';
+
+      const time   = document.createElement('span');
+      time.className = 'msg-time';
+      time.textContent = ts;
+
+      meta.appendChild(sender);
+      meta.appendChild(time);
+      div.appendChild(meta);
+    }
+
+    const body = document.createElement('div');
+    body.className = 'msg-body';
+
+    if (role === 'avril') {
+      body.innerHTML = _renderMarkdown(text);
+      // Attach copy handlers to per-code-block copy buttons
+      body.querySelectorAll('.code-copy-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const code = btn.previousElementSibling.querySelector('code').textContent;
+          navigator.clipboard.writeText(code).then(() => {
+            btn.textContent = 'copied!';
+            setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+          }).catch(() => {
+            btn.textContent = 'fail';
+            setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+          });
+        });
+      });
+
+      // Attach todo checkbox listeners — check/uncheck updates backend
+      body.querySelectorAll('.todo-cb').forEach(cb => {
+        cb.addEventListener('change', async () => {
+          const id        = cb.dataset.id;
+          const newStatus = cb.checked ? 'done' : 'pending';
+          const item      = cb.closest('.todo-item');
+          if (item) item.className = `todo-item ${cb.checked ? 'todo-done' : 'todo-pending'}`;
+          // Update progress counter in card header
+          const card = cb.closest('.todo-card');
+          if (card) {
+            const total   = card.querySelectorAll('.todo-cb').length;
+            const done    = card.querySelectorAll('.todo-cb:checked').length;
+            const counter = card.querySelector('.todo-card-count');
+            if (counter) counter.textContent = `${done}/${total}`;
+          }
+          try { await API.updateTodo(id, newStatus); }
+          catch (e) { console.warn('[Todo] update failed:', e); }
+        });
+      });
+    } else {
+      body.textContent = text;
+    }
+
+    div.appendChild(body);
+
+    // Copy button on Avril messages
+    if (role === 'avril') {
+      const actions = document.createElement('div');
+      actions.className = 'msg-actions';
+
+      const btn = document.createElement('button');
+      btn.className   = 'copy-btn';
+      btn.textContent = 'copy';
+      btn.addEventListener('click', () => {
+        navigator.clipboard.writeText(text).then(() => {
+          btn.textContent = 'copied!';
+          setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+        }).catch(() => {
+          btn.textContent = 'failed';
+          setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+        });
+      });
+
+      actions.appendChild(btn);
+      div.appendChild(actions);
+    }
+
+    _msgsEl.appendChild(div);
+    _scrollBottom();
+
+    // Persist user and avril messages (skip system/ephemeral, skip replay to avoid double-store)
+    if (!replay && (role === 'user' || role === 'avril')) {
+      // Truncate long messages before storing to prevent localStorage overflow
+      const stored = text.length > _MAX_MSG_STORE ? text.slice(0, _MAX_MSG_STORE) + '\u2026' : text;
+      _history.push({ role, text: stored, ts });
+      if (_history.length > _MAX_HISTORY) _history = _history.slice(-_MAX_HISTORY);
+      _saveHistory();
+    }
+
+    return div;
+  }
+
+  function _scrollBottom() {
+    requestAnimationFrame(() => { _msgsEl.scrollTop = _msgsEl.scrollHeight; });
+  }
+
+  // ── Thinking indicator ─────────────────────────────────────────────────────
+
+  function showThinking() {
+    _thinkEl.style.display = 'flex';
+    _scrollBottom();
+  }
+
+  function hideThinking() {
+    _thinkEl.style.display = 'none';
+  }
+
+  // ── Core send (used by public API and slash commands) ──────────────────────
+
+  async function sendText(text) {
+    if (!text) return;
+    addMessage('user', text);
+    showThinking();
+    _busy = true;
+    _updateBtn();
+
+    try {
+      const data = await API.sendMessage(text);
+      if (data.response !== undefined) {
+        addMessage('avril', data.response);
+      } else {
+        addMessage('system', 'Error: ' + (data.error || 'Empty response'));
+      }
+    } catch (e) {
+      addMessage('system', 'Network error: ' + e.message);
+    } finally {
+      hideThinking();
+      _busy = false;
+      _updateBtn();
+      _inputEl.focus();
+    }
+  }
+
+  function _updateBtn() {
+    _sendBtn.disabled = _busy;
+  }
+
+  // ── Slash command handler ──────────────────────────────────────────────────
+
+  async function _handleSlash(raw) {
+    const parts = raw.slice(1).trim().split(/\s+/);
+    const cmd   = parts[0].toLowerCase();
+
+    switch (cmd) {
+      case 'help': {
+        addMessage('system', [
+          'Slash commands:',
+          '  /help      — this list',
+          '  /status    — system status',
+          '  /tasks     — active tasks',
+          '  /memory    — memory + facts',
+          '  /restart   — restart info',
+          '',
+          'Also works: !status  !tasks  !abort  !memory  !restart',
+          '',
+          'Keyboard: Ctrl+K → new chat',
+        ].join('\n'));
+        return;
+      }
+
+      case 'status': {
+        addMessage('user', '/status');
+        showThinking();
+        try {
+          const s     = await API.getStatus();
+          const lines = ['System Status:'];
+          if (s.cpu_percent  !== undefined) lines.push(`  CPU    : ${s.cpu_percent}%`);
+          if (s.ram_used_gb  !== undefined) lines.push(`  RAM    : ${s.ram_used_gb} / ${s.ram_total_gb} GB  (${s.ram_percent}%)`);
+          if (s.disk_used_gb !== undefined) lines.push(`  Disk   : ${s.disk_used_gb} / ${s.disk_total_gb} GB  (${s.disk_percent}%)`);
+          else if (s.disk_info)             lines.push(`  Disk   : ${s.disk_info}`);
+          if (s.model)                      lines.push(`  Model  : ${s.model}`);
+          if (s.decision_model)             lines.push(`  Planner: ${s.decision_model}`);
+          addMessage('avril', lines.join('\n'));
+        } catch (e) {
+          addMessage('system', 'Could not reach /status: ' + e.message);
+        } finally {
+          hideThinking();
+        }
+        return;
+      }
+
+      case 'tasks': {
+        addMessage('user', '/tasks');
+        showThinking();
+        try {
+          const t = await API.getTasks();
+          if (!t.tasks || !t.tasks.length) {
+            addMessage('avril', 'No active tasks.');
+          } else {
+            const lines = [`Active Tasks (${t.count}):`];
+            t.tasks.forEach(tk => {
+              lines.push(`  [${tk.id}] ${tk.title} — ${(tk.steps || []).length} steps`);
+            });
+            addMessage('avril', lines.join('\n'));
+          }
+        } catch (e) {
+          addMessage('system', 'Could not reach /tasks: ' + e.message);
+        } finally {
+          hideThinking();
+        }
+        return;
+      }
+
+      case 'memory':
+      case 'restart': {
+        // Delegate to backend via ! command
+        await sendText('!' + cmd);
+        return;
+      }
+
+      default: {
+        addMessage('system', `Unknown command: /${cmd}  (type /help for list)`);
+        return;
+      }
+    }
+  }
+
+  // ── Public send (reads input, applies extraPrompt) ─────────────────────────
+
+  async function send() {
+    const raw = _inputEl.value.trim();
+    if (!raw || _busy) return;
+    _busy = true;        // Lock FIRST — prevents double-submit before any async work
+    _updateBtn();
+    _inputEl.value = '';
+
+    if (raw.startsWith('/')) {
+      // Slash command path — always unlock when done
+      try {
+        await _handleSlash(raw);
+      } finally {
+        _busy = false;
+        _updateBtn();
+        _inputEl.focus();
+      }
+      return;
+    }
+
+    // Apply extra prompt prefix (stored in settings)
+    const extra   = Settings.get('extraPrompt');
+    const payload = extra ? `${extra.trim()}\n\n${raw}` : raw;
+
+    // Show the original (un-prefixed) text in UI, send the full payload to API
+    addMessage('user', raw);
+    showThinking();
+
+    try {
+      const data = await API.sendMessage(payload);
+      if (data.response !== undefined) {
+        addMessage('avril', data.response);
+      } else {
+        addMessage('system', 'Error: ' + (data.error || 'Empty response'));
+      }
+    } catch (e) {
+      addMessage('system', 'Network error: ' + e.message);
+    } finally {
+      hideThinking();
+      _busy = false;
+      _updateBtn();
+      _inputEl.focus();
+    }
+  }
+
+  // ── New chat ───────────────────────────────────────────────────────────────
+
+  function newChat() {
+    _msgsEl.innerHTML = '';
+    _history = [];
+    try { localStorage.removeItem(_STORAGE_KEY); } catch {}
+    addMessage('system', 'New chat started. Memory and facts are preserved.');
+    _inputEl.focus();
+  }
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+
+  function init() {
+    _msgsEl  = document.getElementById('messages');
+    _inputEl = document.getElementById('msg-input');
+    _sendBtn = document.getElementById('send-btn');
+    _thinkEl = document.getElementById('thinking-bar');
+
+    _sendBtn.addEventListener('click', send);
+    _inputEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+
+    document.getElementById('new-chat-btn').addEventListener('click', newChat);
+
+    // Global keyboard shortcut: Ctrl+K → new chat
+    document.addEventListener('keydown', e => {
+      if (e.ctrlKey && e.key === 'k') { e.preventDefault(); newChat(); }
+    });
+
+    // Restore previous session messages, then show ready prompt
+    _loadHistory();
+    if (_history.length === 0) {
+      addMessage('system', 'Avril is ready.  Type /help for frontend commands.');
+    }
+  }
+
+  return { init, send, sendText, newChat, addMessage, showThinking, hideThinking };
+})();
+
+================================================================================
+FILE: ui/js/settings.js
+================================================================================
+/**
+ * settings.js — App-wide state, persisted to localStorage.
+ * This module has no DOM dependencies; safe to load first.
+ */
+
+const Settings = (() => {
+  const STORAGE_KEY = 'avril_settings_v1';
+
+  const _defaults = {
+    personality: 'default',
+    personalityLocked: false,
+    extraPrompt: '',
+    activeMode: false,
+    screenWatch: false,
+  };
+
+  let _state = { ..._defaults };
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) _state = { ..._defaults, ...JSON.parse(raw) };
+    } catch (e) {
+      console.warn('[Settings] Load failed:', e);
+      _state = { ..._defaults };
+    }
+  }
+
+  function save() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(_state));
+    } catch (e) {
+      console.warn('[Settings] Save failed:', e);
+    }
+  }
+
+  function get(key) {
+    return _state[key];
+  }
+
+  function set(key, value) {
+    _state[key] = value;
+    save();
+  }
+
+  function getAll() {
+    return { ..._state };
+  }
+
+  return { load, save, get, set, getAll };
+})();
+
+================================================================================
+FILE: ui/js/sidebar.js
+================================================================================
+/**
+ * sidebar.js — Three-dot settings panel + real-time status polling.
+ * Depends on: api.js, settings.js, chat.js
+ */
+
+const Sidebar = (() => {
+  let _panelEl   = null;
+  let _overlayEl = null;
+  let _isOpen    = false;
+
+  let _screenWatchInterval = null;
+  let _statusInterval      = null;
+
+  let _taskCache    = [];   // latest [{id, title, steps, status}] from /tasks
+  let _toolFeedCache= [];   // latest [{tool, timestamp, result_preview, error}] from /tool-feed
+  let _autoEnabled  = true; // cached autonomous mode state
+
+  // ── Panel open / close / toggle ────────────────────────────────────────────
+
+  function open() {
+    _buildPanel();       // rebuild to reflect current state before opening
+    _isOpen = true;
+    _panelEl.classList.add('open');
+    _overlayEl.classList.add('active');
+  }
+
+  function close() {
+    _isOpen = false;
+    _panelEl.classList.remove('open');
+    _overlayEl.classList.remove('active');
+  }
+
+  function toggle() {
+    _isOpen ? close() : open();
+  }
+
+  // ── Persona ────────────────────────────────────────────────────────────────
+
+  async function _applyPersona(mode) {
+    const locked = Settings.get('personalityLocked');
+    Settings.set('personality', mode);
+    _updateModeButtons(mode);
+    try {
+      await API.setPersona(mode, locked);
+    } catch (e) {
+      console.warn('[Sidebar] setPersona failed:', e.message);
+    }
+  }
+
+  function _updateModeButtons(active) {
+    if (!_panelEl) return;
+    _panelEl.querySelectorAll('.mode-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.mode === active);
+    });
+  }
+
+  // ── Screen watch ──────────────────────────────────────────────────────────
+
+  function _startScreenWatch() {
+    // Guard prevents duplicate intervals if called more than once (BUG 6).
+    // _statusInterval (status) and _screenWatchInterval (screen) are independent
+    // — they share the same 5s cadence but never interfere with each other.
+    if (_screenWatchInterval) return;
+    _fetchAndShowScreen();                          // immediate first read
+    _screenWatchInterval = setInterval(_fetchAndShowScreen, 5000);
+  }
+
+  async function _fetchAndShowScreen() {
+    try {
+      const data = await API.getScreen();
+      _setScreenText(
+        data.text
+          ? `[${data.timestamp}]\n${data.text.slice(0, 600)}`
+          : 'No screen data yet.'
+      );
+      // Active Avril form detection
+      if (Settings.get('activeMode') && data.text) {
+        const lower    = data.text.toLowerCase();
+        const formKeys = ['name', 'email', 'address', 'phone', 'submit', 'password'];
+        const hits     = formKeys.filter(k => lower.includes(k));
+        if (hits.length >= 2) _showFormBanner();
+      }
+    } catch {
+      _setScreenText('Screen data unavailable.');
+    }
+  }
+
+  function _stopScreenWatch() {
+    if (_screenWatchInterval) {
+      clearInterval(_screenWatchInterval);
+      _screenWatchInterval = null;
+    }
+    _setScreenText('Screen watch disabled.');
+  }
+
+  function _setScreenText(text) {
+    const el = document.getElementById('screen-text');
+    if (el) el.textContent = text;
+  }
+
+  // ── Form-assist banner ────────────────────────────────────────────────────
+
+  function _showFormBanner() {
+    if (document.getElementById('form-assist-banner')) return;   // already shown
+
+    const banner = document.createElement('div');
+    banner.id        = 'form-assist-banner';
+    banner.className = 'form-assist-banner';
+    banner.innerHTML = `
+      <span>Avril detected a form. Assist filling?</span>
+      <button id="fa-yes">Yes</button>
+      <button id="fa-no">Dismiss</button>
+    `;
+    document.body.appendChild(banner);
+
+    document.getElementById('fa-yes').addEventListener('click', () => {
+      banner.remove();
+      Chat.sendText('There is a form visible on screen. Please help me fill it out.');
+    });
+    document.getElementById('fa-no').addEventListener('click', () => banner.remove());
+  }
+
+  // ── Mini status (header dot + panel stats) ─────────────────────────────────
+
+  async function _refreshStatus() {
+    try {
+      const s   = await API.getStatus();
+      const dot = document.getElementById('header-dot');
+      if (dot) { dot.className = 'dot dot-online'; dot.title = 'online'; }
+
+      const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+      if (s.cpu_percent  !== undefined) set('mini-cpu',   s.cpu_percent + '%');
+      if (s.ram_percent  !== undefined) set('mini-ram',   s.ram_percent + '%');
+      if (s.model)                      set('mini-model', s.model.split(':')[0]);
+    } catch {
+      const dot = document.getElementById('header-dot');
+      if (dot) { dot.className = 'dot dot-offline'; dot.title = 'offline'; }
+    }
+  }
+
+  // ── Task Viewer + Tool Feed ────────────────────────────────────────────────
+
+  async function _refreshTasks() {
+    try {
+      const data  = await API.getTasks();
+      _taskCache  = data.tasks || [];
+      _renderTaskViewer();
+    } catch {}
+  }
+
+  async function _refreshToolFeed() {
+    try {
+      const data    = await API.getToolFeed(15);
+      _toolFeedCache = data.feed || [];
+      _renderToolFeed();
+    } catch {}
+  }
+
+  function _renderTaskViewer() {
+    const el = document.getElementById('task-viewer-list');
+    if (!el) return;
+    if (!_taskCache.length) {
+      el.innerHTML = '<div class="feed-empty">No active tasks</div>';
+      return;
+    }
+    el.innerHTML = _taskCache.map(t => `
+      <div class="task-card">
+        <div class="task-card-title">${_esc(t.title)}</div>
+        <div class="task-card-meta">[${_esc(t.id)}] &middot; ${(t.steps||[]).length} steps &middot; ${_esc(t.status||'active')}</div>
+      </div>
+    `).join('');
+  }
+
+  function _renderToolFeed() {
+    const el = document.getElementById('tool-feed-list');
+    if (!el) return;
+    if (!_toolFeedCache.length) {
+      el.innerHTML = '<div class="feed-empty">No tool activity yet</div>';
+      return;
+    }
+    el.innerHTML = _toolFeedCache.slice(0, 10).map(f => `
+      <div class="feed-item${f.error ? ' feed-item-error' : ''}">
+        <div class="feed-item-header">
+          <span class="feed-tool">${_esc(f.tool)}</span>
+          <span class="feed-ts">${_esc(f.timestamp)}</span>
+        </div>
+        <div class="feed-result">${_esc((f.result_preview||'').slice(0, 120))}</div>
+      </div>
+    `).join('');
+  }
+
+  // ── Autonomous mode ───────────────────────────────────────────────────────
+
+  async function _fetchAutoState() {
+    try {
+      const data  = await API.getAutonomous();
+      _autoEnabled = data.enabled;
+      _updateAutoBtn();
+    } catch {}
+  }
+
+  function _updateAutoBtn() {
+    const btn = document.getElementById('auto-btn');
+    if (!btn) return;
+    if (_autoEnabled) {
+      btn.textContent = '⬢ AUTO';
+      btn.className   = 'auto-btn-on';
+      btn.title       = 'Autonomous tasks ON — click to pause';
+    } else {
+      btn.textContent = '⬡ AUTO';
+      btn.className   = 'auto-btn-off';
+      btn.title       = 'Autonomous tasks OFF — click to resume';
+    }
+  }
+
+  async function _toggleAuto() {
+    const next = !_autoEnabled;
+    try {
+      await API.setAutonomous(next);
+      _autoEnabled = next;
+      _updateAutoBtn();
+      // Sync the toggle inside the panel if it is open
+      const tog = document.getElementById('toggle-autonomous');
+      if (tog) tog.checked = _autoEnabled;
+    } catch (e) {
+      console.warn('[Sidebar] setAutonomous failed:', e.message);
+    }
+  }
+
+  // ── Sidebar todos ─────────────────────────────────────────────────────────
+
+  async function _refreshTodos() {
+    try {
+      const data = await API.getTodos();
+      _renderSidebarTodos(data.todos || []);
+    } catch {}
+  }
+
+  function _renderSidebarTodos(todos) {
+    const el = document.getElementById('sidebar-todos');
+    if (!el) return;
+    if (!todos.length) {
+      el.innerHTML = '<div class="feed-empty">No todos yet</div>';
+      return;
+    }
+    el.innerHTML = todos.map(t => {
+      const isDone    = t.status === 'done';
+      const isActive  = t.status === 'in_progress';
+      const cls = isDone ? 'stodo-done' : isActive ? 'stodo-progress' : '';
+      return `<label class="stodo-item ${cls}">` +
+             `<input type="checkbox" class="stodo-cb" data-id="${_esc(t.id)}" ${isDone ? 'checked' : ''}>` +
+             `<span class="stodo-text">${_esc(t.content)}</span></label>`;
+    }).join('');
+    // Attach listeners after render
+    el.querySelectorAll('.stodo-cb').forEach(cb => {
+      cb.addEventListener('change', async () => {
+        const newStatus = cb.checked ? 'done' : 'pending';
+        const item = cb.closest('.stodo-item');
+        if (item) item.className = `stodo-item ${cb.checked ? 'stodo-done' : ''}`;
+        try { await API.updateTodo(cb.dataset.id, newStatus); } catch {}
+      });
+    });
+  }
+
+  // ── Build panel HTML ───────────────────────────────────────────────────────
+  // Rebuilt every time the panel is opened so it always reflects current state.
+
+  function _esc(s) {
+    return String(s || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function _buildPanel() {
+    const st    = Settings.getAll();
+    const modes = ['default', 'coding', 'teacher', 'assistant'];
+
+    _panelEl.innerHTML = `
+      <div class="panel-header">
+        <span>Settings</span>
+        <button class="close-btn" id="panel-close" title="Close">✕</button>
+      </div>
+
+      <div class="panel-body">
+
+        <!-- ── Mode ───────────────────────────────────────────────────── -->
+        <section class="settings-section">
+          <h3>Mode</h3>
+          <div class="mode-buttons">
+            ${modes.map(m => `
+              <button class="mode-btn${st.personality === m ? ' active' : ''}" data-mode="${m}">
+                ${m.charAt(0).toUpperCase() + m.slice(1)}
+              </button>`).join('')}
+          </div>
+        </section>
+
+        <!-- ── Personality ─────────────────────────────────────────────── -->
+        <section class="settings-section">
+          <h3>Personality</h3>
+          <label class="toggle-label">
+            <span>Lock Personality</span>
+            <input type="checkbox" id="lock-personality" ${st.personalityLocked ? 'checked' : ''}>
+            <span class="toggle-switch"></span>
+          </label>
+          <p class="hint">When locked, Avril won't auto-switch mode based on keywords.</p>
+        </section>
+
+        <!-- ── Extra Prompt ────────────────────────────────────────────── -->
+        <section class="settings-section">
+          <h3>Extra Prompt</h3>
+          <textarea id="extra-prompt" rows="3"
+            placeholder="Prepended silently to every message…">${_esc(st.extraPrompt)}</textarea>
+          <p class="hint">Example: "Always respond concisely and in plain text."</p>
+        </section>
+
+        <!-- ── Active Features ─────────────────────────────────────────── -->
+        <section class="settings-section">
+          <h3>Active Features</h3>
+
+          <div class="toggle-row toggle-row-auto">
+            <label class="toggle-label">
+              <span>Autonomous Tasks</span>
+              <input type="checkbox" id="toggle-autonomous" ${_autoEnabled ? 'checked' : ''}>
+              <span class="toggle-switch toggle-switch-auto"></span>
+            </label>
+            <p class="hint">Background goals run silently — no chat messages. Toggle also changes the AUTO button.</p>
+          </div>
+
+          <div class="toggle-row">
+            <label class="toggle-label">
+              <span>Active Avril</span>
+              <input type="checkbox" id="toggle-active" ${st.activeMode ? 'checked' : ''}>
+              <span class="toggle-switch"></span>
+            </label>
+            <p class="hint">Poll screen every 5 s and offer to help with detected forms.</p>
+          </div>
+
+          <div class="toggle-row">
+            <label class="toggle-label">
+              <span>Screen Watch</span>
+              <input type="checkbox" id="toggle-screen" ${st.screenWatch ? 'checked' : ''}>
+              <span class="toggle-switch"></span>
+            </label>
+            <p class="hint">Show latest OCR output in this panel.</p>
+          </div>
+        </section>
+
+        <!-- ── Screen output (visible if screenWatch on) ───────────────── -->
+        <section class="settings-section" id="screen-watch-section"
+          style="display:${st.screenWatch ? 'block' : 'none'}">
+          <h3>Latest Screen</h3>
+          <pre id="screen-text" class="screen-pre">Loading…</pre>
+        </section>
+
+        <!-- ── Voice ──────────────────────────────────────────────────── -->
+        <section class="settings-section">
+          <h3>Voice</h3>
+          <p class="hint muted">Coming soon.</p>
+        </section>
+
+        <!-- ── Active Tasks ───────────────────────────────────────────── -->
+        <section class="settings-section">
+          <h3>Active Tasks</h3>
+          <div id="task-viewer-list" class="feed-list"></div>
+        </section>
+
+        <!-- ── Todos ──────────────────────────────────────────────────── -->
+        <section class="settings-section">
+          <h3>Todos</h3>
+          <div id="sidebar-todos" class="feed-list"></div>
+          <button id="clear-done-btn" class="hint-btn" style="margin-top:6px">Clear completed</button>
+        </section>
+
+        <!-- ── Tool Activity ──────────────────────────────────────────── -->
+        <section class="settings-section">
+          <h3>Tool Activity</h3>
+          <div id="tool-feed-list" class="feed-list"></div>
+        </section>
+
+        <!-- ── System mini-stats ──────────────────────────────────────── -->
+        <section class="settings-section">
+          <h3>System</h3>
+          <div class="mini-stat"><span class="sl">CPU  </span><span id="mini-cpu"   class="sv">-</span></div>
+          <div class="mini-stat"><span class="sl">RAM  </span><span id="mini-ram"   class="sv">-</span></div>
+          <div class="mini-stat"><span class="sl">Model</span><span id="mini-model" class="sv">-</span></div>
+        </section>
+
+      </div>
+    `;
+
+    // ── Bind events ──────────────────────────────────────────────────────────
+
+    document.getElementById('panel-close').addEventListener('click', close);
+
+    _panelEl.querySelectorAll('.mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => _applyPersona(btn.dataset.mode));
+    });
+
+    document.getElementById('lock-personality').addEventListener('change', e => {
+      Settings.set('personalityLocked', e.target.checked);
+      // Push updated lock state to backend with current mode
+      API.setPersona(Settings.get('personality'), e.target.checked).catch(() => {});
+    });
+
+    document.getElementById('extra-prompt').addEventListener('input', e => {
+      Settings.set('extraPrompt', e.target.value);
+    });
+
+    document.getElementById('toggle-autonomous').addEventListener('change', async e => {
+      try {
+        await API.setAutonomous(e.target.checked);
+        _autoEnabled = e.target.checked;
+        _updateAutoBtn();
+      } catch (err) {
+        console.warn('[Sidebar] setAutonomous:', err.message);
+        e.target.checked = _autoEnabled; // Revert on failure
+      }
+    });
+
+    document.getElementById('toggle-active').addEventListener('change', e => {
+      Settings.set('activeMode', e.target.checked);
+      // Screen watch is required for Active Avril; auto-enable it
+      if (e.target.checked && !Settings.get('screenWatch')) {
+        const sw = document.getElementById('toggle-screen');
+        if (sw) sw.checked = true;
+        Settings.set('screenWatch', true);
+        document.getElementById('screen-watch-section').style.display = 'block';
+        _startScreenWatch();
+      }
+    });
+
+    document.getElementById('toggle-screen').addEventListener('change', e => {
+      Settings.set('screenWatch', e.target.checked);
+      const section = document.getElementById('screen-watch-section');
+      if (e.target.checked) {
+        section.style.display = 'block';
+        _startScreenWatch();
+      } else {
+        section.style.display = 'none';
+        _stopScreenWatch();
+        Settings.set('activeMode', false);            // also disable active mode
+        const ta = document.getElementById('toggle-active');
+        if (ta) ta.checked = false;
+      }
+    });
+
+    // Refresh status numbers inside panel immediately
+    _refreshStatus();
+
+    // Render cached task/feed/todo data immediately, then fetch fresh
+    _renderTaskViewer();
+    _renderToolFeed();
+    _refreshTasks();
+    _refreshToolFeed();
+    _refreshTodos();
+
+    // Clear-done todos button
+    const clearDoneBtn = document.getElementById('clear-done-btn');
+    if (clearDoneBtn) {
+      clearDoneBtn.addEventListener('click', async () => {
+        try {
+          await fetch(window.location.origin + '/todos/clear-done', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }
+          });
+        } catch {}
+        await _refreshTodos();
+      });
+    }
+
+    // If screen watch was already active, start showing data
+    if (Settings.get('screenWatch')) _fetchAndShowScreen();
+  }
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+
+  function init() {
+    _panelEl   = document.getElementById('settings-panel');
+    _overlayEl = document.getElementById('overlay');
+
+    document.getElementById('menu-btn').addEventListener('click', toggle);
+    _overlayEl.addEventListener('click', close);
+
+    // Escape key closes panel
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && _isOpen) close();
+    });
+
+    // AUTO button in header — click toggles autonomous mode
+    const autoBtn = document.getElementById('auto-btn');
+    if (autoBtn) autoBtn.addEventListener('click', _toggleAuto);
+
+    // Fetch autonomous mode from backend and update button immediately
+    _fetchAutoState();
+
+    // Global status dot polling
+    _refreshStatus();
+    _statusInterval = setInterval(_refreshStatus, 5000);
+
+    // Background task + todo polling (keeps cache warm; renders on panel open)
+    _refreshTasks();
+    _refreshTodos();
+    setInterval(_refreshTasks, 10000);
+    setInterval(_refreshTodos, 15000);
+
+    // Resume screen watch if it was on when page was last closed
+    if (Settings.get('screenWatch')) _startScreenWatch();
+  }
+
+  return { init, open, close, toggle };
+})();
+
+================================================================================
+END OF 9/10 — Frontend UI (ui/)
+================================================================================

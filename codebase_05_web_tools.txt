@@ -1,0 +1,1394 @@
+================================================================================
+PROJECT: AVRIL — Personal Advanced AI Assistant
+PART: 5/10 — Web Tools (tools/web/ + pdf)
+================================================================================
+Owner / Pen name: Divyansh (Bazric)
+AI Name: Avril (Satomi)
+Stack: Python (Flask + Ollama) backend | Node.js (Baileys) WhatsApp bot | Vanilla JS UI
+Exported: 2026-03-13 21:54:22
+Section: Web package: browser, DuckDuckGo search, fetch/scrape, Wikipedia; PDF reader
+================================================================================
+
+ARCHITECTURE:
+  User (Browser)
+      |
+  [ui/index.html]  <-- standalone dark-theme control panel (served at /app)
+      | fetch() via api.js
+      |
+  User (WhatsApp)
+      |
+  [whatsapp-ai-bot/server.js  :3000]  <-- index.html (Web Setup UI)
+      | axios POST /chat
+      |
+  [ai-model/core/api_server.py  :8000]  <-- main.py entry
+      |
+      +-- core/agent_loop.py        (2-tier fast path + plan-tool-respond loop)
+      +-- core/brain.py             (model routing + fallback)
+      +-- core/context_builder.py   (memory assembly, raw log truncation, screen cache)
+      +-- core/state.py             (agentic state machine)
+      +-- core/system_shortcuts.py  (Hyprland shortcuts for planner awareness)
+      +-- core/autonomous_mode.py   (global flag — enable/disable background tasks)
+      +-- engines/fact_engine.py    (structured facts — extracted BEFORE context build)
+      +-- engines/task_manager.py   (multi-task persistent tracking)
+      +-- engines/memory_engine.py  (vector search + add_memory)
+      +-- engines/janitor.py        (maintenance / summarizer trigger)
+      +-- engines/summarizer.py     (log summarization)
+      +-- engines/goal_scheduler.py (daemon thread — fires scheduled goals silently)
+      +-- engines/todo_manager.py   (CRUD for memory/todos.json)
+      +-- tools/registry.py         (tool loader + safe/risky gate + TOOL CATEGORIES)
+      +-- tools/files.py
+      +-- tools/screenshot.py       (active-window OCR, noise-filtered, writes screen_cache)
+      +-- tools/system_diagnostics.py
+      +-- tools/actions.py          (ydotool mouse/keyboard — individual low-level moves)
+      +-- tools/computer_use.py     (scan_screen, click_map, smart_click, type_into, open_url)
+      +-- tools/ui_parser.py        (YOLO UI detection + targeted OCR — replaces OCR-only)
+      +-- tools/screen_map.py       (structured element map: OCR fallback pipeline)
+      +-- tools/browser_control.py  (Playwright DOM-based web automation — Layer 1)
+      +-- tools/ui_positions.json   (pre-saved pixel positions per site/app)
+      +-- tools/window_manager.py   (hyprctl window/app control)
+      +-- tools/terminal_safe.py    (allowlisted safe shell execution)
+      +-- tools/todos.py            (agent tool — create/update/list/clear todos)
+      +-- tools/utilities.py        (flip_coin, roll_dice, time_now, convert_units, etc.)
+      +-- tools/skill_builder.py    (AI skill creation with USER APPROVAL GATE)
+      +-- tools/code.py             (sandboxed Python exec/eval — restricted builtins)
+      +-- tools/skills/             (AI-created skill files, auto-loaded on startup)
+      +-- tools/web/                (web tools package)
+      |     __init__.py, http_client.py, browser.py, search.py, fetch.py, wikipedia.py, inspect.py
+      +-- tools/pdf.py              (PDF read, info, topics, page extraction, keyword search)
+      +-- tools/google/             (Google Apps package — OAuth2)
+      |     __init__.py, auth.py, drive.py, calendar.py, classroom.py, gmail.py
+      +-- personality/              (persona prompts: default, coding, teacher, assistant)
+      +-- memory/                   (tasks.json, facts.json, todos.json, identity.json, goals.json, etc.)
+      +-- helpers/                  (start.sh, stop.sh, status.sh, engineering_brief.py)
+      +-- models/                   (UI detection model: ui_detect.pt)
+
+  API:  /chat  /health  /tasks  /status  /logs  /persona  /screen
+        /autonomous  /todos  /todos/<id>  /todos/clear-done  /tool-feed
+        /debug-screen  /ui-parse  /skills  /skills/<name>/approve|reject
+  UI:   http://localhost:8000/app  (new full control panel)
+        http://localhost:8000/ui   (legacy inline text console)
+  Principles:
+    - UI communicates only through HTTP — never imports AI code directly
+    - CORS enabled so ui/ can also be opened as a plain file://
+    - Skills require user approval before activation
+    - UI parser uses YOLO detection when model available, OCR fallback otherwise
+
+================================================================================
+FILE: ai-model/tools/web/__init__.py  [dispatcher]
+================================================================================
+# ========================= tools/web/__init__.py =========================
+"""
+Web browser automation tools — package entry point.
+
+Structure:
+  tools/web/
+    __init__.py      ← this file (dispatcher)
+    http_client.py   ← shared SSL-aware HTTP helpers + HTML-to-text
+    browser.py       ← open_browser (Firefox only)
+    search.py        ← web_search   (DuckDuckGo HTML + Lite fallback)
+    fetch.py         ← fetch_page, scrape_page
+    wikipedia.py     ← wikipedia    (REST API, no key)
+    inspect.py       ← inspect_page, find_forms, find_buttons, find_links, find_headings
+
+Usage:
+  from tools import web
+  web.run_tool({"action": "web_search",    "query": "python news"})
+  web.run_tool({"action": "open_browser",  "url": "github.com"})
+  web.run_tool({"action": "fetch_page",    "url": "https://example.com"})
+  web.run_tool({"action": "scrape_page",   "url": "https://python.org"})
+  web.run_tool({"action": "wikipedia",     "query": "quantum computing"})
+  web.run_tool({"action": "inspect_page",  "url": "https://example.com"})
+  web.run_tool({"action": "find_forms",    "url": "https://example.com"})
+  web.run_tool({"action": "find_buttons",  "url": "https://example.com"})
+  web.run_tool({"action": "find_links",    "url": "https://example.com"})
+  web.run_tool({"action": "find_headings", "url": "https://example.com"})
+  web.run_tool({"action": "list"})
+"""
+
+from tools.web.browser   import open_browser
+from tools.web.search    import web_search
+from tools.web.fetch     import fetch_page, scrape_page
+from tools.web.wikipedia import wikipedia
+from tools.web.inspect   import (
+    inspect_page, find_forms, find_buttons, find_links, find_headings
+)
+
+
+def _list_actions(_: dict) -> str:
+    return (
+        "Web tools  (tools/web/)\n"
+        "  open_browser    Open URL in detected browser   [url, private=false]          → browser.py\n"
+        "  web_search      DuckDuckGo + Lite fallback     [query, max_results=5]        → search.py\n"
+        "  fetch_page      Readable page text             [url, max_chars=3000]         → fetch.py\n"
+        "  scrape_page     Text + external links          [url, max_chars=2000]         → fetch.py\n"
+        "  wikipedia       Wikipedia summary              [query, lang=en, full=false]  → wikipedia.py\n"
+        "  inspect_page    Full page structure map        [url, max_links=20]           → inspect.py\n"
+        "  find_forms      All forms & input fields       [url]                         → inspect.py\n"
+        "  find_buttons    All buttons & submits          [url]                         → inspect.py\n"
+        "  find_links      All navigation links           [url, max_links=30]           → inspect.py\n"
+        "  find_headings   Heading hierarchy h1–h3        [url]                         → inspect.py"
+    )
+
+
+_ACTIONS = {
+    "open_browser":  open_browser,
+    "web_search":    web_search,
+    "fetch_page":    fetch_page,
+    "scrape_page":   scrape_page,
+    "wikipedia":     wikipedia,
+    "inspect_page":  inspect_page,
+    "find_forms":    find_forms,
+    "find_buttons":  find_buttons,
+    "find_links":    find_links,
+    "find_headings": find_headings,
+    "list":          _list_actions,
+}
+
+
+def run_tool(args: dict = None) -> str:
+    if args is None:
+        args = {}
+    action = str(args.get("action", "")).strip().lower()
+    if not action:
+        return "[web] No action specified. Use action='list' to see available tools."
+    fn = _ACTIONS.get(action)
+    if fn is None:
+        return f"[web] Unknown action '{action}'. Available: {', '.join(_ACTIONS)}"
+    try:
+        return fn(args)
+    except Exception as e:
+        return f"[web] Error in '{action}': {e}"
+
+================================================================================
+FILE: ai-model/tools/web/http_client.py  [SSL-aware HTTP + html_to_text]
+================================================================================
+# ========================= tools/web/http_client.py =========================
+"""
+Shared HTTP utilities for all web submodules.
+Provides http_get, http_post, html_to_text with SSL verification.
+"""
+
+import ipaddress
+import re
+import socket
+import ssl
+import urllib.request
+import urllib.parse
+import urllib.error
+from html.parser import HTMLParser
+
+# SSL context: certifi bundle → system default
+try:
+    import certifi as _certifi
+    SSL_CTX = ssl.create_default_context(cafile=_certifi.where())
+except ImportError:
+    SSL_CTX = ssl.create_default_context()
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+TIMEOUT = 12  # seconds
+
+
+def _is_private_url(url: str) -> bool:
+    """Return True if the URL resolves to a private/loopback IP (SSRF guard)."""
+    try:
+        host = urllib.parse.urlparse(url).hostname
+        if not host:
+            return True
+        for info in socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
+            addr = info[4][0]
+            if ipaddress.ip_address(addr).is_private:
+                return True
+    except Exception:
+        pass  # DNS failure → let urlopen handle it
+    return False
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Block redirects to private/internal IPs."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _is_private_url(newurl):
+            raise urllib.error.URLError(
+                f"Redirect to private network blocked: {newurl}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_SafeRedirectHandler)
+
+
+def http_get(url: str, extra_headers: dict = None) -> str:
+    """GET request with SSL verification. Returns response body as string."""
+    if _is_private_url(url):
+        raise urllib.error.URLError(f"Request to private network blocked: {url}")
+    req = urllib.request.Request(url, headers={**HEADERS, **(extra_headers or {})})
+    with _opener.open(req, timeout=TIMEOUT) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.read().decode(charset, errors="replace")
+
+
+def http_post(url: str, data: dict) -> str:
+    """POST url-encoded form data with SSL verification."""
+    if _is_private_url(url):
+        raise urllib.error.URLError(f"Request to private network blocked: {url}")
+    encoded = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(url, data=encoded, headers={
+        **HEADERS,
+        "Content-Type": "application/x-www-form-urlencoded",
+    })
+    with _opener.open(req, timeout=TIMEOUT) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return resp.read().decode(charset, errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# HTML → plain text (no external deps)
+# ---------------------------------------------------------------------------
+
+class _TextExtractor(HTMLParser):
+    _SKIP  = {"script", "style", "head", "noscript", "meta", "link", "svg", "path"}
+    _BLOCK = {"p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6",
+              "li", "tr", "td", "th", "blockquote", "pre", "article",
+              "section", "header", "footer", "main", "aside"}
+
+    def __init__(self):
+        super().__init__()
+        self._skip_depth = 0
+        self._parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skip_depth += 1
+        if tag in self._BLOCK and self._parts and self._parts[-1] != "\n":
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        if tag in self._BLOCK:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            clean = data.strip()
+            if clean:
+                self._parts.append(clean + " ")
+
+    def get_text(self) -> str:
+        raw = "".join(self._parts)
+        return re.sub(r"\n{3,}", "\n\n", raw).strip()
+
+
+def html_to_text(html: str) -> str:
+    p = _TextExtractor()
+    p.feed(html)
+    return p.get_text()
+
+================================================================================
+FILE: ai-model/tools/web/browser.py  [open_browser]
+================================================================================
+# ========================= tools/web/browser.py =========================
+"""Open URLs in Firefox only. Never falls back to other browsers."""
+
+import shutil
+import subprocess
+
+
+def open_browser(args: dict) -> str:
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return "[open_browser] No 'url' provided."
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    private = str(args.get("private", "false")).lower() in ("true", "1", "yes")
+
+    firefox = shutil.which("firefox") or shutil.which("firefox-esr")
+    if not firefox:
+        return "[open_browser] Firefox is not installed. Automation requires Firefox."
+
+    try:
+        cmd = [firefox]
+        if private:
+            cmd.append("--private-window")
+        cmd.append(url)
+
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        mode = " (private)" if private else ""
+        return f"Opened Firefox: {url}{mode}"
+
+    except Exception as e:
+        return f"[open_browser] Failed to open Firefox: {e}"
+
+================================================================================
+FILE: ai-model/tools/web/search.py  [DuckDuckGo + Lite fallback]
+================================================================================
+# ========================= tools/web/search.py =========================
+"""DuckDuckGo web search — HTML parser with DDG Lite fallback."""
+
+from html.parser import HTMLParser
+from tools.web.http_client import http_post, http_get
+from tools.web.browser import open_browser
+
+
+# ── Primary parser — DuckDuckGo HTML ──────────────────────────────────────────
+
+class _DdgParser(HTMLParser):
+    """Extracts title, url, snippet from DuckDuckGo HTML results."""
+
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._state  = None
+        self._cur    = {}
+        self._href   = ""
+
+    def handle_starttag(self, tag, attrs):
+        a   = dict(attrs)
+        cls = a.get("class", "")
+        if tag == "a" and "result__a" in cls:
+            self._state = "title"
+            self._href  = a.get("href", "")
+            self._cur   = {"title": "", "url": self._href, "snippet": ""}
+        elif tag == "a" and "result__snippet" in cls:
+            self._state = "snippet"
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._state in ("title", "snippet"):
+            if self._state == "snippet" and self._cur.get("title"):
+                self.results.append({
+                    "title":   self._cur["title"].strip(),
+                    "url":     self._cur["url"],
+                    "snippet": self._cur["snippet"].strip(),
+                })
+            self._state = None
+
+    def handle_data(self, data):
+        if self._state == "title":
+            self._cur["title"] += data
+        elif self._state == "snippet":
+            self._cur["snippet"] += data
+
+
+# ── Fallback parser — DuckDuckGo Lite ─────────────────────────────────────────
+
+class _DdgLiteParser(HTMLParser):
+    """
+    Parses https://lite.duckduckgo.com/lite/ — simpler, more stable HTML.
+    Result rows alternate: <a class="result-link"> title/url, then snippet <td>.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.results     = []
+        self._in_link    = False
+        self._in_snippet = False
+        self._cur        = {}
+
+    def handle_starttag(self, tag, attrs):
+        a   = dict(attrs)
+        cls = a.get("class", "")
+        if tag == "a" and "result-link" in cls:
+            self._in_link = True
+            self._cur = {"title": "", "url": a.get("href", ""), "snippet": ""}
+        elif tag == "td" and "result-snippet" in cls and self._cur.get("title"):
+            self._in_snippet = True
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._in_link:
+            self._in_link = False
+        if tag == "td":
+            if self._cur.get("title") and self._cur.get("url"):
+                if self._cur not in self.results:
+                    self.results.append(dict(self._cur))
+            self._in_snippet = False
+
+    def handle_data(self, data):
+        if self._in_link:
+            self._cur["title"] += data
+        elif getattr(self, "_in_snippet", False):
+            self._cur["snippet"] = self._cur.get("snippet", "") + data
+
+
+def _search_lite(query: str, max_r: int) -> list:
+    """Fallback: query DDG Lite and return result list."""
+    try:
+        html = http_post("https://lite.duckduckgo.com/lite/", {"q": query, "kl": "us-en"})
+    except Exception:
+        return []
+    parser = _DdgLiteParser()
+    parser.feed(html)
+    return parser.results[:max_r]
+
+
+# ── Public function ────────────────────────────────────────────────────────────
+
+def web_search(args: dict) -> str:
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return "[web_search] No 'query' provided."
+
+    max_r      = max(1, min(int(args.get("max_results", 5)), 10))
+    open_first = str(args.get("open", "false")).lower() in ("true", "1", "yes")
+
+    # ── Try primary DDG HTML ──────────────────────────────────────────────────
+    results = []
+    rate_limited = False
+    try:
+        html = http_post("https://html.duckduckgo.com/html/", {"q": query, "kl": "us-en"})
+        if "please try again" in html.lower() or "blocked" in html.lower() or len(html) < 500:
+            rate_limited = True
+        else:
+            parser = _DdgParser()
+            parser.feed(html)
+            results = parser.results[:max_r]
+    except Exception:
+        pass
+
+    # ── Fallback: DDG Lite ────────────────────────────────────────────────────
+    if not results:
+        results = _search_lite(query, max_r)
+
+    if not results:
+        if rate_limited:
+            return f"[web_search] DuckDuckGo rate-limited the request for: '{query}'. Try again shortly."
+        return f"[web_search] No results found for: '{query}'"
+
+    if open_first:
+        open_browser({"url": results[0]["url"]})
+
+    lines = [f"Search results for: **{query}**\n"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"{i}. **{r['title']}**")
+        lines.append(f"   {r['url']}")
+        if r["snippet"]:
+            lines.append(f"   {r['snippet']}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+================================================================================
+FILE: ai-model/tools/web/fetch.py  [fetch_page, scrape_page]
+================================================================================
+# ========================= tools/web/fetch.py =========================
+"""Fetch a URL and return readable text or text+links (scrape)."""
+
+import urllib.error
+from html.parser import HTMLParser
+from tools.web.http_client import http_get, html_to_text
+
+
+class _LinkExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            href = dict(attrs).get("href", "")
+            if href and href.startswith(("http://", "https://")):
+                self.links.append(href)
+
+
+def fetch_page(args: dict) -> str:
+    """Fetch a URL and return clean readable text."""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return "[fetch_page] No 'url' provided."
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    max_chars = max(500, min(int(args.get("max_chars", 3000)), 10000))
+
+    try:
+        html = http_get(url)
+    except urllib.error.HTTPError as e:
+        return f"[fetch_page] HTTP {e.code}: {e.reason} — {url}"
+    except urllib.error.URLError as e:
+        return f"[fetch_page] Connection failed: {e.reason}"
+    except Exception as e:
+        return f"[fetch_page] Error: {e}"
+
+    text = html_to_text(html)
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n\n[... truncated at {max_chars} chars]"
+
+    return f"**{url}**\n\n{text}"
+
+
+def scrape_page(args: dict) -> str:
+    """Fetch a URL and return text + extracted external links."""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return "[scrape_page] No 'url' provided."
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    max_chars = max(500, min(int(args.get("max_chars", 2000)), 8000))
+    max_links = int(args.get("max_links", 10))
+
+    try:
+        html = http_get(url)
+    except urllib.error.HTTPError as e:
+        return f"[scrape_page] HTTP {e.code}: {e.reason} — {url}"
+    except urllib.error.URLError as e:
+        return f"[scrape_page] Connection failed: {e.reason}"
+    except Exception as e:
+        return f"[scrape_page] Error: {e}"
+
+    text = html_to_text(html)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n[... truncated]"
+
+    # Deduplicated links
+    lp = _LinkExtractor()
+    lp.feed(html)
+    seen, unique = set(), []
+    for lnk in lp.links:
+        if lnk not in seen:
+            seen.add(lnk)
+            unique.append(lnk)
+
+    links_section = ""
+    if unique:
+        shown = unique[:max_links]
+        links_section = "\n\n**Links found:**\n" + "\n".join(f"  - {l}" for l in shown)
+        if len(unique) > max_links:
+            links_section += f"\n  ... and {len(unique) - max_links} more"
+
+    return f"**{url}**\n\n{text}{links_section}"
+
+================================================================================
+FILE: ai-model/tools/web/wikipedia.py  [wikipedia lookup]
+================================================================================
+# ========================= tools/web/wikipedia.py =========================
+"""Wikipedia article search and summary via the official REST API."""
+
+import json
+import urllib.parse
+from tools.web.http_client import http_get
+
+
+def wikipedia(args: dict) -> str:
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return "[wikipedia] No 'query' provided."
+
+    lang = str(args.get("lang", "en")).strip().lower()[:5]
+    full = str(args.get("full", "false")).lower() in ("true", "1", "yes")
+
+    # Step 1: find page title via opensearch
+    search_url = (
+        f"https://{lang}.wikipedia.org/w/api.php?"
+        + urllib.parse.urlencode({
+            "action":    "opensearch",
+            "search":    query,
+            "limit":     "3",
+            "format":    "json",
+            "redirects": "resolve",
+        })
+    )
+    try:
+        raw   = http_get(search_url, {"Accept": "application/json"})
+        data  = json.loads(raw)
+    except Exception as e:
+        return f"[wikipedia] Search failed: {e}"
+
+    titles = data[1] if len(data) > 1 else []
+    if not titles:
+        return f"[wikipedia] No Wikipedia article found for: '{query}'"
+
+    # Step 2: get summary via REST API
+    page_title    = titles[0]
+    encoded_title = urllib.parse.quote(page_title.replace(" ", "_"))
+    summary_url   = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{encoded_title}"
+
+    try:
+        summary_raw = http_get(summary_url, {"Accept": "application/json"})
+        info = json.loads(summary_raw)
+    except Exception as e:
+        return f"[wikipedia] Summary fetch failed: {e}"
+
+    if info.get("type") == "disambiguation":
+        options = "\n".join(f"  - {t}" for t in titles)
+        return (
+            f"Wikipedia disambiguation for '{query}':\n{options}\n\n"
+            "Try a more specific query."
+        )
+
+    title   = info.get("title", page_title)
+    extract = info.get("extract", info.get("description", "No summary available."))
+    url     = info.get("content_urls", {}).get("desktop", {}).get("page", summary_url)
+
+    if not full and len(extract) > 1500:
+        extract = extract[:1500] + "\n[... truncated. Use full=true for complete text]"
+
+    return f"**{title}** — Wikipedia\n\n{extract}\n\nSource: {url}"
+
+================================================================================
+FILE: ai-model/tools/web/inspect.py  [inspect_page, find_forms, etc.]
+================================================================================
+# ========================= tools/web/inspect.py =========================
+"""
+HTML page inspector — fetches a URL and extracts its interactive structure.
+
+Actions:
+  inspect_page   Full structural map of a page   [url=..., max_links=20]
+  find_forms     Extract all forms and their fields
+  find_buttons   List all clickable buttons / submit inputs
+  find_links     List navigation links and anchors
+  find_headings  Page heading hierarchy (h1–h3)
+
+Unlike fetch_page (which returns text), inspect_page returns the *structure*:
+what buttons exist, what forms ask for, what navigation looks like.
+Useful for web automation, form-filling, and UI understanding.
+"""
+
+import urllib.error
+from html.parser import HTMLParser
+from tools.web.http_client import http_get
+
+
+# ── HTML parser ───────────────────────────────────────────────────────────────
+
+class _Inspector(HTMLParser):
+    """Single-pass parser that collects page structure into categorised lists."""
+
+    def __init__(self):
+        super().__init__()
+        self.title       = ""
+        self.description = ""
+        self.headings    = []        # (level, text)
+        self.forms       = []        # list of form dicts
+        self.buttons     = []        # standalone buttons (outside forms)
+        self.nav_links   = []        # links inside <nav>
+        self.all_links   = []        # all <a href> links
+
+        self._in_title   = False
+        self._in_nav     = False
+        self._nav_depth  = 0
+        self._cur_form   = None
+        self._cur_head   = None      # (level, chars accumulated)
+        self._in_button  = False
+        self._cur_btn    = ""
+        self._cur_link   = None      # current <a> entry being parsed (for text capture)
+        self._buf        = ""        # generic text buffer for other tags
+
+    # ── tag open ─────────────────────────────────────────────────────────────
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+
+        if tag == "title":
+            self._in_title = True; return
+
+        if tag == "meta":
+            name = a.get("name", "").lower()
+            if name == "description":
+                self.description = a.get("content", "")[:200]
+            return
+
+        if tag in ("h1", "h2", "h3"):
+            self._cur_head = (tag, ""); return
+
+        if tag == "nav":
+            self._in_nav = True; self._nav_depth += 1; return
+        if tag == "form":
+            self._cur_form = {
+                "action":  a.get("action", "(none)"),
+                "method":  a.get("method", "get").upper(),
+                "id":      a.get("id", ""),
+                "name":    a.get("name", ""),
+                "fields":  [],
+            }; return
+
+        if tag in ("input", "select", "textarea") and self._cur_form is not None:
+            ftype  = a.get("type", "text" if tag == "input" else tag).lower()
+            fname  = a.get("name", "") or a.get("id", "") or f"({tag})"
+            fphdr  = a.get("placeholder", "") or a.get("label", "")
+            freq   = "required" in a
+            if ftype not in ("hidden", "submit", "button", "reset", "image"):
+                self._cur_form["fields"].append({
+                    "type": ftype, "name": fname,
+                    "placeholder": fphdr, "required": freq,
+                })
+            elif ftype in ("submit", "button"):
+                val = a.get("value", "Submit")
+                self._cur_form["fields"].append({"type": "submit", "value": val})
+            return
+
+        if tag == "button":
+            btype = a.get("type", "button").lower()
+            if self._cur_form is not None:
+                self._cur_form["fields"].append({
+                    "type": f"button[{btype}]",
+                    "value": a.get("value", ""),
+                })
+            else:
+                self._in_button = True; self._cur_btn = ""; return
+
+        if tag == "a":
+            href = a.get("href", "").strip()
+            text_hint = a.get("aria-label", "") or a.get("title", "")
+            if href and href not in ("#", "javascript:void(0)", "javascript:;"):
+                entry = {"href": href, "label": text_hint}
+                if self._in_nav:
+                    self.nav_links.append(entry)
+                self.all_links.append(entry)
+                self._cur_link = entry  # capture text children for label
+            return
+
+    # ── tag close ────────────────────────────────────────────────────────────
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False; return
+
+        if tag in ("h1", "h2", "h3") and self._cur_head:
+            lvl, txt = self._cur_head
+            if txt.strip():
+                self.headings.append((lvl, txt.strip()[:120]))
+            self._cur_head = None; return
+
+        if tag == "nav":
+            self._nav_depth = max(0, self._nav_depth - 1)
+            if self._nav_depth == 0:
+                self._in_nav = False
+            return
+
+        if tag == "form" and self._cur_form is not None:
+            self.forms.append(self._cur_form)
+            self._cur_form = None; return
+
+        if tag == "button" and self._in_button:
+            if self._cur_btn.strip():
+                self.buttons.append(self._cur_btn.strip()[:80])
+            self._in_button = False; self._cur_btn = ""; return
+
+        if tag == "a" and self._cur_link is not None:
+            # Normalise label — strip whitespace, cap length
+            self._cur_link["label"] = self._cur_link.get("label", "").strip()[:120]
+            self._cur_link = None
+
+    # ── text ──────────────────────────────────────────────────────────────────
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data; return
+        if self._cur_head:
+            self._cur_head = (self._cur_head[0], self._cur_head[1] + data); return
+        if self._in_button:
+            self._cur_btn += data; return
+        # Capture text content of <a> tags as link labels (when no aria-label/title)
+        if self._cur_link is not None and not self._cur_link.get("label"):
+            self._cur_link["label"] = self._cur_link.get("label", "") + data
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _fetch_and_parse(url: str):
+    """Return (inspector, error_str)."""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        html = http_get(url)
+    except urllib.error.HTTPError as e:
+        return None, f"[inspect] HTTP {e.code}: {e.reason}"
+    except urllib.error.URLError as e:
+        return None, f"[inspect] Connection failed: {e.reason}"
+    except Exception as e:
+        return None, f"[inspect] Error: {e}"
+
+    ins = _Inspector()
+    try:
+        ins.feed(html)
+    except Exception:
+        pass  # partial parse is fine
+    return ins, None
+
+
+def _fmt_field(f: dict) -> str:
+    parts = [f"  [{f.get('type','?')}]", f.get('name','')]
+    if f.get("placeholder"):
+        parts.append(f"  ← \"{f['placeholder']}\"")
+    if f.get("required"):
+        parts.append("  (required)")
+    if f.get("value") and f.get("type") in ("submit", "button[submit]", "button[button]"):
+        parts.append(f"  \"{f['value']}\"")
+    return "    " + " ".join(p for p in parts if p.strip())
+
+
+# ── Actions ───────────────────────────────────────────────────────────────────
+
+def inspect_page(args: dict) -> str:
+    """Full structural overview: title, description, headings, forms, buttons, nav."""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return "[inspect] No 'url' provided."
+    max_links = int(args.get("max_links", 20))
+
+    ins, err = _fetch_and_parse(url)
+    if err:
+        return err
+
+    lines = [f"Page Inspection: {url}", "=" * 60]
+
+    # ── Meta ───────────────────────────────────────────────────────────────
+    lines.append(f"\nTitle:       {ins.title.strip() or '(none)'}")
+    if ins.description:
+        lines.append(f"Description: {ins.description}")
+
+    # ── Headings ───────────────────────────────────────────────────────────
+    if ins.headings:
+        lines.append(f"\nHeadings ({len(ins.headings)}):")
+        for lvl, text in ins.headings[:20]:
+            indent = "  " * (int(lvl[1]) - 1)
+            lines.append(f"  {indent}<{lvl}> {text}")
+    else:
+        lines.append("\nHeadings: none found")
+
+    # ── Forms ──────────────────────────────────────────────────────────────
+    if ins.forms:
+        lines.append(f"\nForms ({len(ins.forms)}):")
+        for i, form in enumerate(ins.forms, 1):
+            label = form["name"] or form["id"] or f"form-{i}"
+            lines.append(f"  Form {i}: {label}  [{form['method']} → {form['action']}]")
+            for field in form["fields"]:
+                lines.append(_fmt_field(field))
+    else:
+        lines.append("\nForms: none found")
+
+    # ── Standalone Buttons ─────────────────────────────────────────────────
+    if ins.buttons:
+        lines.append(f"\nStandalone Buttons ({len(ins.buttons)}):")
+        for btn in ins.buttons[:15]:
+            lines.append(f"  [button] {btn}")
+
+    # ── Navigation ─────────────────────────────────────────────────────────
+    nav = ins.nav_links or ins.all_links[:max_links]
+    if nav:
+        label = "Navigation links" if ins.nav_links else "Links (no <nav> tag found)"
+        shown = nav[:max_links]
+        lines.append(f"\n{label} ({len(shown)} of {len(nav)}):")
+        for lnk in shown:
+            lbl = f"  {lnk['label']}  →  " if lnk.get("label") else "  "
+            lines.append(f"{lbl}{lnk['href']}")
+
+    return "\n".join(lines)
+
+
+def find_forms(args: dict) -> str:
+    """Return all forms with field details."""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return "[inspect] No 'url' provided."
+    ins, err = _fetch_and_parse(url)
+    if err:
+        return err
+    if not ins.forms:
+        return f"No forms found on {url}"
+    lines = [f"Forms on {url}:", "=" * 60]
+    for i, form in enumerate(ins.forms, 1):
+        label = form["name"] or form["id"] or f"form-{i}"
+        lines.append(f"\nForm {i}: {label}")
+        lines.append(f"  Submit to: {form['method']} {form['action']}")
+        if form["fields"]:
+            lines.append("  Fields:")
+            for field in form["fields"]:
+                lines.append(_fmt_field(field))
+    return "\n".join(lines)
+
+
+def find_buttons(args: dict) -> str:
+    """Return all buttons and submit inputs."""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return "[inspect] No 'url' provided."
+    ins, err = _fetch_and_parse(url)
+    if err:
+        return err
+    items = []
+    for form in ins.forms:
+        for f in form["fields"]:
+            if "submit" in f.get("type", "") or "button" in f.get("type", ""):
+                items.append(f"[{f['type']}] {f.get('value') or f.get('name','')}")
+    for btn in ins.buttons:
+        items.append(f"[button] {btn}")
+    if not items:
+        return f"No buttons found on {url}"
+    return f"Buttons on {url} ({len(items)}):\n" + "\n".join(f"  {b}" for b in items)
+
+
+def find_links(args: dict) -> str:
+    """Return navigation links and all <a href> links."""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return "[inspect] No 'url' provided."
+    max_links = int(args.get("max_links", 30))
+    ins, err = _fetch_and_parse(url)
+    if err:
+        return err
+    links = ins.all_links[:max_links]
+    if not links:
+        return f"No links found on {url}"
+    nav_hrefs = {l["href"] for l in ins.nav_links}
+    lines = [f"Links on {url} ({len(links)}):", "=" * 60]
+    for lnk in links:
+        tag = " [nav]" if lnk["href"] in nav_hrefs else ""
+        lbl = f" ({lnk['label']})" if lnk.get("label") else ""
+        lines.append(f"  {lnk['href']}{lbl}{tag}")
+    return "\n".join(lines)
+
+
+def find_headings(args: dict) -> str:
+    """Return page heading hierarchy (h1–h3)."""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return "[inspect] No 'url' provided."
+    ins, err = _fetch_and_parse(url)
+    if err:
+        return err
+    if not ins.headings:
+        return f"No headings found on {url}"
+    lines = [f"Headings on {url}:", "=" * 60]
+    for lvl, text in ins.headings:
+        indent = "  " * (int(lvl[1]) - 1)
+        lines.append(f"  {indent}<{lvl}> {text}")
+    return "\n".join(lines)
+
+================================================================================
+FILE: ai-model/tools/pdf.py  [PDF read/analyse]
+================================================================================
+# ========================= tools/pdf.py =========================
+"""
+PDF reading, analysis, and extraction tool.
+
+Actions:
+  read     Extract full text from a PDF        [path=..., max_chars=8000]
+  pages    Extract specific page range          [path=..., start=1, end=5]
+  info     PDF metadata and structure info      [path=...]
+  topics   Extract headings and key topics      [path=..., top=20]
+  search   Search for a keyword inside PDF      [path=..., keyword=...]
+  list     Show all available actions
+"""
+
+import os
+import re
+from collections import Counter
+
+
+# ---------------------------------------------------------------------------
+# Import guard — pypdf is required
+# ---------------------------------------------------------------------------
+try:
+    import pypdf
+    _PYPDF_OK = True
+except ImportError:
+    _PYPDF_OK = False
+
+# ---------------------------------------------------------------------------
+# OCR fallback — optional: pytesseract + pdf2image + system tesseract
+#   pip install pytesseract pdf2image
+#   sudo pacman -S tesseract tesseract-data-eng   (Arch/CachyOS)
+# ---------------------------------------------------------------------------
+try:
+    import pytesseract
+    from pdf2image import convert_from_path as _pdf2img
+    _OCR_OK = True
+except ImportError:
+    _OCR_OK = False
+
+_OCR_INSTALL_MSG = (
+    "[pdf] Scanned PDF — no text layer found.\n"
+    "To enable OCR install:\n"
+    "  pip install pytesseract pdf2image\n"
+    "  sudo pacman -S tesseract tesseract-data-eng"
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _require_pypdf() -> str | None:
+    if not _PYPDF_OK:
+        return "[pdf] pypdf is not installed. Run: pip install pypdf"
+    return None
+
+
+def _resolve_path(raw: str) -> str:
+    """Expand ~ and make absolute."""
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def _open_pdf(path: str):
+    """Return (reader, None) or (None, error_str)."""
+    err = _require_pypdf()
+    if err:
+        return None, err
+    if not path:
+        return None, "[pdf] No 'path' provided."
+    path = _resolve_path(path)
+    if not os.path.exists(path):
+        return None, f"[pdf] File not found: {path}"
+    if not path.lower().endswith(".pdf"):
+        return None, f"[pdf] File does not look like a PDF: {path}"
+    try:
+        reader = pypdf.PdfReader(path)
+        return reader, None
+    except Exception as e:
+        return None, f"[pdf] Cannot open PDF: {e}"
+
+
+def _extract_all_text(reader) -> str:
+    """Extract text from every page, joined with page markers."""
+    parts = []
+    for i, page in enumerate(reader.pages, 1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        if text.strip():
+            parts.append(f"--- Page {i} ---\n{text.strip()}")
+    return "\n\n".join(parts)
+
+
+def _ocr_extract(path: str, first_page: int = None, last_page: int = None) -> str:
+    """
+    Convert PDF pages to images and run tesseract OCR.
+    first_page / last_page are 1-based (None = all pages).
+    Returns extracted text, or an install-hint string if OCR unavailable.
+    """
+    if not _OCR_OK:
+        return _OCR_INSTALL_MSG
+    try:
+        kwargs = {}
+        if first_page:
+            kwargs["first_page"] = first_page
+        if last_page:
+            kwargs["last_page"] = last_page
+        images = _pdf2img(path, **kwargs)
+    except Exception as e:
+        return f"[pdf] OCR image conversion failed: {e}"
+
+    parts = []
+    offset = (first_page or 1)
+    for i, img in enumerate(images):
+        page_num = offset + i
+        try:
+            text = pytesseract.image_to_string(img)
+        except Exception:
+            text = ""
+        if text.strip():
+            parts.append(f"--- Page {page_num} (OCR) ---\n{text.strip()}")
+
+    return "\n\n".join(parts)
+
+
+def _looks_like_heading(line: str) -> bool:
+    """Heuristic: short, non-empty, ends without period, mostly alphanumeric."""
+    line = line.strip()
+    if not line or len(line) > 120:
+        return False
+    if line.endswith(".") or line.endswith(","):
+        return False
+    # Must have at least one letter
+    if not re.search(r"[A-Za-z]", line):
+        return False
+    # Typical heading patterns
+    if re.match(r"^(\d+[\.\d]*\s+|[IVXLC]+\.\s+|[A-Z]\.\s+)", line):
+        return True
+    # All-caps or Title Case short line
+    words = line.split()
+    if len(words) <= 8:
+        cap_words = sum(1 for w in words if w[0].isupper() if w)
+        if cap_words / len(words) >= 0.7:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+def _read(args: dict) -> str:
+    path = str(args.get("path", "")).strip()
+    reader, err = _open_pdf(path)
+    if err:
+        return err
+
+    max_chars = max(1000, min(int(args.get("max_chars", 8000)), 50000))
+    total_pages = len(reader.pages)
+    text = _extract_all_text(reader)
+
+    if not text.strip():
+        if _OCR_OK:
+            text = _ocr_extract(path)
+            if not text.strip():
+                return f"[pdf] OCR found no text in '{os.path.basename(path)}'."
+            ocr_used = True
+        else:
+            return _OCR_INSTALL_MSG
+    else:
+        ocr_used = False
+
+    ocr_note = " [OCR via tesseract]" if ocr_used else ""
+    header = f"PDF: {os.path.basename(path)} ({total_pages} pages){ocr_note}\n{'='*50}\n\n"
+    full = header + text
+
+    if len(full) > max_chars:
+        full = full[:max_chars] + f"\n\n[... truncated at {max_chars} chars. Use pages= to read specific sections]"
+
+    return full
+
+
+def _pages(args: dict) -> str:
+    path = str(args.get("path", "")).strip()
+    reader, err = _open_pdf(path)
+    if err:
+        return err
+
+    total = len(reader.pages)
+    try:
+        start = max(1, int(args.get("start", 1)))
+        end   = min(total, int(args.get("end", start + 4)))
+    except (ValueError, TypeError):
+        return "[pdf] 'start' and 'end' must be page numbers (integers)."
+
+    if start > total:
+        return f"[pdf] PDF only has {total} pages. 'start' is out of range."
+
+    parts = []
+    for i in range(start - 1, end):
+        try:
+            text = reader.pages[i].extract_text() or ""
+        except Exception:
+            text = ""
+        parts.append(f"--- Page {i+1} ---\n{text.strip()}")
+
+    # If all pages are empty (scanned PDF), try OCR for this page range
+    all_empty = all(p.endswith("---\n") for p in parts)
+    ocr_note  = ""
+    if all_empty:
+        ocr_text = _ocr_extract(path, first_page=start, last_page=end)
+        if ocr_text.strip() and not ocr_text.startswith("[pdf]"):
+            return (
+                f"PDF: {os.path.basename(path)} — Pages {start}–{end} of {total} [OCR]\n"
+                + "=" * 50 + "\n\n" + ocr_text
+            )
+        elif not _OCR_OK:
+            ocr_note = f"\n\n{_OCR_INSTALL_MSG}"
+
+    return (
+        f"PDF: {os.path.basename(path)} — Pages {start}–{end} of {total}\n"
+        + "=" * 50 + "\n\n"
+        + "\n\n".join(parts)
+        + ocr_note
+    )
+
+
+def _info(args: dict) -> str:
+    path = str(args.get("path", "")).strip()
+    reader, err = _open_pdf(path)
+    if err:
+        return err
+
+    total_pages = len(reader.pages)
+    meta = reader.metadata or {}
+
+    def _m(key):
+        val = meta.get(key, "")
+        return str(val).strip() if val else "—"
+
+    # Estimate word count from first 10 pages
+    sample_text = ""
+    for page in reader.pages[:10]:
+        try:
+            sample_text += page.extract_text() or ""
+        except Exception:
+            pass
+    word_sample = len(sample_text.split())
+    est_words = int(word_sample * (total_pages / min(total_pages, 10)))
+    is_encrypted = reader.is_encrypted
+
+    lines = [
+        f"File: {os.path.basename(path)}",
+        f"Path: {_resolve_path(path)}",
+        f"Pages: {total_pages}",
+        f"Encrypted: {'Yes' if is_encrypted else 'No'}",
+        f"Estimated words: ~{est_words:,}",
+        "",
+        "Metadata:",
+        f"  Title:    {_m('/Title')}",
+        f"  Author:   {_m('/Author')}",
+        f"  Subject:  {_m('/Subject')}",
+        f"  Creator:  {_m('/Creator')}",
+        f"  Producer: {_m('/Producer')}",
+        f"  Created:  {_m('/CreationDate')}",
+        f"  Modified: {_m('/ModDate')}",
+    ]
+
+    # Check if text-extractable
+    if not is_encrypted:
+        first_text = ""
+        try:
+            first_text = reader.pages[0].extract_text() or ""
+        except Exception:
+            pass
+        lines.append("")
+        if first_text.strip():
+            lines.append("Text extraction: Supported (text-based PDF)")
+        else:
+            ocr_status = "OCR available (pytesseract)" if _OCR_OK else "OCR not installed — pip install pytesseract pdf2image"
+            lines.append(f"Text extraction: NOT supported (scanned PDF) — {ocr_status}")
+
+    return "\n".join(lines)
+
+
+def _topics(args: dict) -> str:
+    path = str(args.get("path", "")).strip()
+    reader, err = _open_pdf(path)
+    if err:
+        return err
+
+    top_n = max(5, min(int(args.get("top", 20)), 50))
+    full_text = _extract_all_text(reader)
+
+    if not full_text.strip():
+        return "[pdf] No extractable text found. Cannot detect topics."
+
+    # ── 1. Extract headings ────────────────────────────────────────────────
+    headings = []
+    for line in full_text.splitlines():
+        line = line.strip()
+        if _looks_like_heading(line) and line not in headings:
+            headings.append(line)
+        if len(headings) >= 40:
+            break
+
+    # ── 2. Keyword frequency (skip stopwords) ─────────────────────────────
+    _STOP = {
+        "the","a","an","and","or","but","in","on","at","to","for","of","with",
+        "by","from","as","is","was","are","were","be","been","has","have","had",
+        "it","its","this","that","these","those","they","we","you","he","she",
+        "his","her","their","our","which","who","what","how","when","where","why",
+        "not","no","can","will","would","could","should","may","might","also",
+        "if","then","than","so","up","out","into","through","about","after","before",
+        "any","all","each","more","most","some","such","other","new","use","used",
+    }
+    words = re.findall(r"\b[a-zA-Z]{4,}\b", full_text.lower())
+    filtered = [w for w in words if w not in _STOP]
+    freq = Counter(filtered).most_common(top_n)
+
+    # ── Format output ──────────────────────────────────────────────────────
+    lines = [f"PDF: {os.path.basename(path)} — Topics & Key Terms\n{'='*50}"]
+
+    if headings:
+        lines.append(f"\nHeadings / Sections ({len(headings)} found):")
+        for i, h in enumerate(headings, 1):
+            lines.append(f"  {i:2}. {h}")
+    else:
+        lines.append("\nNo clear headings detected.")
+
+    lines.append(f"\nTop {top_n} Keywords (by frequency):")
+    for word, count in freq:
+        lines.append(f"  {word:<25} {count}×")
+
+    return "\n".join(lines)
+
+
+def _search(args: dict) -> str:
+    path    = str(args.get("path", "")).strip()
+    keyword = str(args.get("keyword", "")).strip()
+    if not keyword:
+        return "[pdf] No 'keyword' provided."
+
+    reader, err = _open_pdf(path)
+    if err:
+        return err
+
+    pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+    matches = []
+    context_chars = 120
+
+    for i, page in enumerate(reader.pages, 1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            continue
+        for m in pattern.finditer(text):
+            start = max(0, m.start() - context_chars // 2)
+            end   = min(len(text), m.end() + context_chars // 2)
+            snippet = text[start:end].replace("\n", " ").strip()
+            matches.append((i, snippet))
+
+    if not matches:
+        return f"[pdf] '{keyword}' not found in {os.path.basename(path)}"
+
+    lines = [
+        f"PDF: {os.path.basename(path)} — Search: '{keyword}' ({len(matches)} match{'es' if len(matches) != 1 else ''})\n{'='*50}"
+    ]
+    for page_num, snippet in matches[:30]:
+        lines.append(f"\nPage {page_num}:")
+        lines.append(f"  ...{snippet}...")
+
+    if len(matches) > 30:
+        lines.append(f"\n[{len(matches) - 30} more matches not shown]")
+
+    return "\n".join(lines)
+
+
+def _list_actions(_: dict) -> str:
+    return (
+        "Available pdf actions:\n"
+        "  read     Extract full text          [path=..., max_chars=8000]\n"
+        "  pages    Specific page range        [path=..., start=1, end=5]\n"
+        "  info     Metadata + structure       [path=...]\n"
+        "  topics   Headings + key keywords    [path=..., top=20]\n"
+        "  search   Find keyword in PDF        [path=..., keyword=...]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+_ACTIONS = {
+    "read":   _read,
+    "pages":  _pages,
+    "info":   _info,
+    "topics": _topics,
+    "search": _search,
+    "list":   _list_actions,
+}
+
+
+def run_tool(args: dict = None) -> str:
+    if args is None:
+        args = {}
+    action = str(args.get("action", "")).strip().lower()
+    if not action:
+        return "[pdf] No action specified. Use action='list' to see available tools."
+    fn = _ACTIONS.get(action)
+    if fn is None:
+        return f"[pdf] Unknown action '{action}'. Available: {', '.join(_ACTIONS)}"
+    try:
+        return fn(args)
+    except Exception as e:
+        return f"[pdf] Error in '{action}': {e}"
+
+================================================================================
+END OF 5/10 — Web Tools (tools/web/ + pdf)
+================================================================================
