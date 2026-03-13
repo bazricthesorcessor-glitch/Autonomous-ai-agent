@@ -199,7 +199,34 @@ def _handle_command(cmd: str):
             "Or: systemctl --user restart avril  (if service is configured)"
         )
 
-    return f"Unknown command: !{action}\nAvailable: !status  !tasks  !abort  !memory  !restart"
+    if action == "skill":
+        from tools import skill_builder
+        sub = (parts[1] if len(parts) > 1 else "").strip()
+        sub_parts = sub.split(maxsplit=1)
+        sub_action = sub_parts[0] if sub_parts else "list"
+        sub_name = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+
+        if sub_action == "list":
+            return skill_builder.run_tool({"action": "list"})
+        elif sub_action == "approve" and sub_name:
+            return skill_builder.run_tool({"action": "approve", "name": sub_name})
+        elif sub_action == "reject" and sub_name:
+            return skill_builder.run_tool({"action": "reject", "name": sub_name})
+        elif sub_action == "inspect" and sub_name:
+            return skill_builder.run_tool({"action": "inspect", "name": sub_name})
+        elif sub_action == "delete" and sub_name:
+            return skill_builder.run_tool({"action": "delete", "name": sub_name})
+        else:
+            return (
+                "Usage:\n"
+                "  !skill list                 — list all skills (active + pending)\n"
+                "  !skill approve <name>       — approve a pending skill\n"
+                "  !skill reject <name>        — reject and delete a pending skill\n"
+                "  !skill inspect <name>       — show skill source code\n"
+                "  !skill delete <name>        — delete a skill"
+            )
+
+    return f"Unknown command: !{action}\nAvailable: !status  !tasks  !abort  !memory  !skill  !restart"
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -365,6 +392,29 @@ def get_tool_feed():
     n = int(request.args.get('limit', 20))
     feed = agent_loop.get_tool_feed()[:n]
     return jsonify({'feed': feed, 'count': len(feed)})
+
+
+# ── Skill management API ─────────────────────────────────────────────────────
+
+@app.route('/skills', methods=['GET'])
+def list_skills():
+    """List all skills with their status (active/pending)."""
+    from tools import skill_builder
+    return jsonify({'result': skill_builder.run_tool({"action": "list"})})
+
+
+@app.route('/skills/<name>/approve', methods=['POST'])
+def approve_skill(name):
+    """Approve a pending skill and activate it."""
+    from tools import skill_builder
+    return jsonify({'result': skill_builder.run_tool({"action": "approve", "name": name})})
+
+
+@app.route('/skills/<name>/reject', methods=['POST'])
+def reject_skill(name):
+    """Reject a pending skill and delete it."""
+    from tools import skill_builder
+    return jsonify({'result': skill_builder.run_tool({"action": "reject", "name": name})})
 
 
 # ── Autonomous mode ───────────────────────────────────────────────────────────
