@@ -438,6 +438,54 @@ def get_screen():
         return jsonify({'error': str(e)}), 500
 
 
+# ── Visual debug endpoint ────────────────────────────────────────────────────
+
+@app.route('/debug-screen', methods=['GET'])
+def debug_screen():
+    """Trigger a screen scan and return the detected UI elements + screenshot path.
+
+    Useful for debugging what AVRIL "sees" on screen.
+    Query params:
+      ?app=firefox  — restrict scan to a specific window (default: full screen)
+    Returns JSON with:
+      - screenshot_path: path to the captured PNG
+      - timestamp: when the scan was taken
+      - element_count: total detected elements
+      - elements: list of {text, x, y, w, h, cx, cy, type, conf}
+      - by_type: elements grouped by type for quick inspection
+    """
+    from tools import screen_map
+
+    app_hint = request.args.get('app', '')
+    if app_hint:
+        from tools.computer_use import _get_window_region
+        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+    else:
+        min_x, max_x, min_y, max_y = 0, 99999, 0, 99999
+
+    elements = screen_map.scan(min_x, max_x, min_y, max_y)
+
+    # Group by type for easier debugging
+    by_type = {}
+    for el in elements:
+        t = el.get('type', 'unknown')
+        by_type.setdefault(t, []).append({
+            'text': el['text'][:60],
+            'cx': el['cx'], 'cy': el['cy'],
+            'w': el['w'], 'h': el['h'],
+        })
+
+    screenshot_path = os.path.join(config.SCREENSHOT_DIR, '_map_screen.png')
+
+    return jsonify({
+        'screenshot_path': screenshot_path,
+        'timestamp': __import__('time').strftime('%Y-%m-%d %H:%M:%S'),
+        'element_count': len(elements),
+        'elements': elements,
+        'by_type': by_type,
+    })
+
+
 @app.route('/app', strict_slashes=False)
 def new_ui_index():
     """Serve the standalone UI index.html from the ui/ folder."""
