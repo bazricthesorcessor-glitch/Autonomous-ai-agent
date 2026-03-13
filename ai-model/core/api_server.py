@@ -494,17 +494,20 @@ def get_screen():
 def debug_screen():
     """Trigger a screen scan and return the detected UI elements + screenshot path.
 
-    Useful for debugging what AVRIL "sees" on screen.
+    Uses ui_parser (YOLO + targeted OCR) when a model is loaded,
+    falls back to screen_map OCR-only pipeline otherwise.
+
     Query params:
       ?app=firefox  — restrict scan to a specific window (default: full screen)
     Returns JSON with:
+      - source: "yolo" or "ocr" (which pipeline was used)
       - screenshot_path: path to the captured PNG
       - timestamp: when the scan was taken
       - element_count: total detected elements
       - elements: list of {text, x, y, w, h, cx, cy, type, conf}
       - by_type: elements grouped by type for quick inspection
     """
-    from tools import screen_map
+    from tools import ui_parser
 
     app_hint = request.args.get('app', '')
     if app_hint:
@@ -513,26 +516,80 @@ def debug_screen():
     else:
         min_x, max_x, min_y, max_y = 0, 99999, 0, 99999
 
-    elements = screen_map.scan(min_x, max_x, min_y, max_y)
+    elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
 
     # Group by type for easier debugging
     by_type = {}
     for el in elements:
         t = el.get('type', 'unknown')
         by_type.setdefault(t, []).append({
-            'text': el['text'][:60],
+            'text': (el.get('text') or '')[:60],
             'cx': el['cx'], 'cy': el['cy'],
             'w': el['w'], 'h': el['h'],
         })
 
-    screenshot_path = os.path.join(config.SCREENSHOT_DIR, '_map_screen.png')
+    # Detect which pipeline was used
+    source = "ocr"
+    try:
+        cache = config.safe_load_json(
+            os.path.join(config.SCREENSHOT_DIR, "screen_map.json"), {}
+        )
+        source = cache.get("source", "ocr")
+    except Exception:
+        pass
+
+    screenshot_path = os.path.join(config.SCREENSHOT_DIR, '_ui_parse.png')
 
     return jsonify({
+        'source': source,
         'screenshot_path': screenshot_path,
         'timestamp': __import__('time').strftime('%Y-%m-%d %H:%M:%S'),
         'element_count': len(elements),
         'elements': elements,
         'by_type': by_type,
+    })
+
+
+@app.route('/ui-parse', methods=['GET'])
+def ui_parse():
+    """Run the UI parser and return structured element data.
+
+    Query params:
+      ?app=firefox      — restrict to a window
+      ?query=Search     — find a specific element (returns single match)
+      ?type=button      — filter by element type
+    """
+    from tools import ui_parser
+
+    app_hint = request.args.get('app', '')
+    query = request.args.get('query', '').strip()
+    el_type = request.args.get('type', '').strip()
+
+    if app_hint:
+        from tools.computer_use import _get_window_region
+        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+    else:
+        min_x, max_x, min_y, max_y = 0, 99999, 0, 99999
+
+    elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
+
+    # Single element search
+    if query:
+        el = ui_parser.find_element(query, elements)
+        if el:
+            return jsonify({'found': True, 'element': el})
+        return jsonify({'found': False, 'query': query, 'total_elements': len(elements)})
+
+    # Type filter
+    if el_type:
+        filtered = ui_parser.find_elements_by_type(el_type, elements)
+        return jsonify({'type': el_type, 'count': len(filtered), 'elements': filtered})
+
+    # Full parse result
+    return jsonify({
+        'model_available': ui_parser.is_model_available(),
+        'count': len(elements),
+        'elements': elements,
     })
 
 
