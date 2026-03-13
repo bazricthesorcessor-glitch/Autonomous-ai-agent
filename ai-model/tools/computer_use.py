@@ -486,24 +486,26 @@ def run_tool(args: dict = None) -> str:
 
     # ── scan_screen ──────────────────────────────────────────────────────
     # Build the structured element map: every visible UI element with bounding box.
+    # Uses YOLO ui_parser when model is available, falls back to OCR screen_map.
     # {"action": "scan_screen"}  or  {"action": "scan_screen", "app": "firefox"}
     elif action == "scan_screen":
-        from tools import screen_map
+        from tools import ui_parser
         app_hint = str(args.get("app", "firefox"))
         min_x, max_x, min_y, max_y = _get_window_region(app_hint)
-        elements = screen_map.scan(min_x, max_x, min_y, max_y)
-        return screen_map.format_map(elements)
+        elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
+        return ui_parser.format_elements(elements)
 
     # ── click_map ────────────────────────────────────────────────────────
     # Find an element in the last scan_screen result and click its center.
     # ALWAYS run scan_screen first, then click_map.
+    # Uses ui_parser.find_element which reads from the shared cache.
     # {"action": "click_map", "text": "Search"}
     elif action == "click_map":
         text = str(args.get("text", "")).strip()
         if not text:
             return "Error: 'text' parameter is required"
-        from tools import screen_map
-        el = screen_map.find_element(text)
+        from tools import ui_parser
+        el = ui_parser.find_element(text)
         if not el:
             return (
                 f"Element '{text}' not found in screen map. "
@@ -525,10 +527,88 @@ def run_tool(args: dict = None) -> str:
             f"at ({cx}, {cy})  size {el['w']}×{el['h']}{verify}"
         )
 
+    # ── smart_click ─────────────────────────────────────────────────────
+    # All-in-one: parse the screen (YOLO+OCR or OCR fallback), find the
+    # element, and click it. Combines scan_screen + click_map in one call.
+    # {"action": "smart_click", "text": "Search", "app": "firefox"}
+    elif action == "smart_click":
+        text = str(args.get("text", "")).strip()
+        if not text:
+            return "Error: 'text' parameter is required"
+        from tools import ui_parser
+        app_hint = str(args.get("app", "firefox"))
+        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+        elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
+        el = ui_parser.find_element(text, elements)
+        if not el:
+            return (
+                f"Element '{text}' not found on screen after parsing. "
+                f"Detected {len(elements)} elements total. "
+                "Try a different search term or take a screenshot to see what's visible."
+            )
+        cx, cy = el["cx"], el["cy"]
+        pre = _pre_snapshot()
+        out = _ydotool("mousemove", "--absolute", "-x", str(cx), "-y", str(cy))
+        if out != "ok":
+            return f"Mouse move to ({cx},{cy}) failed: {out}"
+        time.sleep(0.25)
+        out = _ydotool("click", "0xC0")
+        if out != "ok":
+            return f"Click failed: {out}"
+        time.sleep(0.1)
+        verify = _verify_action("smart_click", pre)
+        return (
+            f"Smart-clicked \"{el.get('text', '')}\" [{el.get('type','?')}] "
+            f"at ({cx}, {cy})  size {el['w']}×{el['h']}{verify}"
+        )
+
+    # ── type_into ───────────────────────────────────────────────────────
+    # Parse screen, find the element, click it, then type text into it.
+    # Combines smart_click + type_text for input fields.
+    # {"action": "type_into", "element": "Search", "text": "lofi music"}
+    elif action == "type_into":
+        element_query = str(args.get("element", "")).strip()
+        text = str(args.get("text", "")).strip()
+        if not element_query:
+            return "Error: 'element' parameter is required"
+        if not text:
+            return "Error: 'text' parameter is required"
+        from tools import ui_parser
+        app_hint = str(args.get("app", "firefox"))
+        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
+        elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
+        el = ui_parser.find_element(element_query, elements)
+        if not el:
+            return (
+                f"Element '{element_query}' not found on screen. "
+                f"Detected {len(elements)} elements. "
+                "Try a different search term."
+            )
+        cx, cy = el["cx"], el["cy"]
+        # Click the field
+        pre = _pre_snapshot()
+        out = _ydotool("mousemove", "--absolute", "-x", str(cx), "-y", str(cy))
+        if out != "ok":
+            return f"Mouse move to ({cx},{cy}) failed: {out}"
+        time.sleep(0.25)
+        out = _ydotool("click", "0xC0")
+        if out != "ok":
+            return f"Click on element failed: {out}"
+        time.sleep(0.3)
+        # Type the text
+        out = _ydotool("type", "--", text)
+        if out != "ok":
+            return f"Typing failed: {out}"
+        verify = _verify_action("type_into", pre)
+        return (
+            f"Clicked \"{el.get('text', '')}\" [{el.get('type','?')}] "
+            f"at ({cx}, {cy}) and typed \"{text}\"{verify}"
+        )
+
     else:
         return (
             f"Unknown action: '{action}'. "
-            "Available: scan_screen, click_map, click_element, save_position, "
-            "list_positions, find_on_screen, click_text, open_url, focus_window, "
-            "type_text, press_key, screenshot"
+            "Available: scan_screen, click_map, smart_click, type_into, "
+            "click_element, save_position, list_positions, find_on_screen, "
+            "click_text, open_url, focus_window, type_text, press_key, screenshot"
         )
