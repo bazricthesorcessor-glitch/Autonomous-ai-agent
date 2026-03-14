@@ -7,11 +7,11 @@ print("Initializing Avril File Structure...")
 
 # Create default JSON files if they don't exist
 defaults = {
-    config.IDENTITY_FILE: {"name": config.USER_NAME, "role": "Creator", "traits": ["obsessive", "protective"]},
-    config.TASKS_FILE: {"active_tasks": {}},
-    config.GOALS_FILE: {"active_goals": ["Build Phase 5 Terminal Control"]},
-    config.SYSTEM_STATE_FILE: {"mode": "normal", "connected_clients": []},
-    config.FACTS_FILE: {}
+    config.IDENTITY_FILE:     {"ai_name": config.AI_NAME, "user": config.USER_NAME, "system": "Arch Linux, Wayland, Hyprland"},
+    config.TASKS_FILE:        {"active": [], "completed": []},
+    config.GOALS_FILE:        {"goals": ["Help Divyansh with any task efficiently and completely"]},
+    config.SYSTEM_STATE_FILE: {"status": "online", "last_restart": None},
+    config.FACTS_FILE:        {}
 }
 
 for path, data in defaults.items():

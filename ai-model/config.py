@@ -40,10 +40,16 @@ SUMMARY_DAYS_WINDOW = 10    # Keep 10 days of summaries (Day 11-20)
 MAX_RAW_TOKENS_PER_DAY = 8000  # Safety cap per day
 
 # === Model Config (Updated to Phi4-Mini) ===
-DECISION_MODEL = "phi4-mini:3.8b"   # Faster planner/router
-CHAT_MODEL = "phi4-mini:3.8b"       # Fast general chat
-CODE_MODEL = "qwen2.5-coder:7b-instruct-q4_K_M" # Specialist coder
+PRIMARY_MODEL = "phi4-mini:3.8b"    # Single reasoning model for brain + chat
+DECISION_MODEL = PRIMARY_MODEL        # Backward-compatible planner alias
+CHAT_MODEL = PRIMARY_MODEL            # Backward-compatible chat alias
+CODE_MODEL = PRIMARY_MODEL            # Backward-compatible code alias
 EMBED_MODEL = "nomic-embed-text-v2-moe:latest"  # Embeddings
+
+# === Perception / automation tuning ===
+PERCEPTION_POLL_INTERVAL = 2.0
+RESPONSE_STABLE_POLLS = 2
+SCREENSHOT_RETENTION_SECONDS = 1800
 
 # === Helper Functions ===
 def get_today_dir():

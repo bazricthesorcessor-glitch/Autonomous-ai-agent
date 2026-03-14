@@ -6,10 +6,18 @@ import config
 
 client = Client(host='http://localhost:11434')
 
+# Approximate character limit to stay within LLM context window
+_MAX_LOG_CHARS = 12000
+
+
 def generate_summary(raw_log_path):
     if not os.path.exists(raw_log_path): return None
     with open(raw_log_path, "r") as f: content = f.read()
     if not content.strip(): return "Empty log."
+
+    # Truncate to avoid blowing context; keep tail (most recent messages)
+    if len(content) > _MAX_LOG_CHARS:
+        content = "... [truncated older messages] ...\n" + content[-_MAX_LOG_CHARS:]
 
     prompt = f"""
 Summarize this conversation log into a structured format.
@@ -55,6 +63,12 @@ def run_summarization():
                     with open(summary_path, "w") as f:
                         f.write(summary_text)
                     print(f"Created summary for {folder}")
+                    # Remove raw log to reclaim disk once summary exists
+                    try:
+                        os.remove(raw_path)
+                        print(f"Cleaned up raw log for {folder}")
+                    except OSError as rm_err:
+                        print(f"[Summarizer] Could not remove {raw_path}: {rm_err}")
         except ValueError:
             continue
 

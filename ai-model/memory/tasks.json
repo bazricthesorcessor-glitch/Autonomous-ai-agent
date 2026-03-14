@@ -1,0 +1,17 @@
+{
+  "active": [],
+  "completed": [
+    {
+      "id": "207c96cf",
+      "title": "smoke-test",
+      "description": "testing after bug fixes",
+      "credentials": {},
+      "steps": [],
+      "status": "completed",
+      "created_at": "2026-03-12 19:32",
+      "last_updated": "2026-03-12 19:32",
+      "completed_at": "2026-03-12 19:32",
+      "summary": "smoke ok"
+    }
+  ]
+}

@@ -37,10 +37,15 @@ TOOL_CATEGORIES = {
         "desc":  "Search the web, fetch pages, browse websites",
         "tools": ["web", "browser_control"],
     },
+    "perception_tools": {
+        "label": "Perception & Vision",
+        "desc":  "Read page state, locate UI elements, monitor OCR completion",
+        "tools": ["vision", "ui_parser", "screenshot"],
+    },
     "computer_tools": {
         "label": "Desktop & Computer Control",
         "desc":  "Screen automation, mouse/keyboard, window management, screenshots, UI detection",
-        "tools": ["computer_use", "actions", "window_manager", "screenshot", "ui_parser"],
+        "tools": ["computer_use", "executor", "actions", "window_manager"],
     },
     "filesystem_tools": {
         "label": "Files & Code",
@@ -77,6 +82,8 @@ def _load():
     from tools import computer_use    # screen OCR + mouse/keyboard automation
     from tools import browser_control  # Playwright DOM-based web automation (Layer 1)
     from tools import ui_parser       # YOLO UI detection + targeted OCR
+    from tools import vision          # structured perception interface
+    from tools import executor        # atomic GUI action executor
     _REGISTRY = {
         'system_diagnostics': system_diagnostics,
         'file_search':        files,
@@ -92,6 +99,8 @@ def _load():
         'browser_control':    browser_control,
         'code':               code,
         'ui_parser':          ui_parser,
+        'vision':             vision,
+        'executor':           executor,
     }
 
     # Optional: load actions tool if ydotool is available

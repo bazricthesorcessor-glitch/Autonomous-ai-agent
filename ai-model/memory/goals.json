@@ -1,0 +1,24 @@
+{
+  "goals": [
+    "Help Divyansh with any task — coding, system fixes, research, automation",
+    "Execute multi-step tasks fully without forgetting progress",
+    "Remember context and personal facts across sessions",
+    "Solve recurring problems once and remember the solution"
+  ],
+  "scheduled": [
+    {
+      "id": "health_check",
+      "prompt": "Run a quick system health check: cpu usage, ram, disk space. If anything is critical (cpu >90%, disk >85%), take note and report. Otherwise just log that all is well.",
+      "interval_minutes": 60,
+      "enabled": false,
+      "last_run": "2026-03-12T15:30:00+00:00"
+    },
+    {
+      "id": "resume_tasks",
+      "prompt": "Check for any active unfinished tasks in the task list. If there are tasks that haven't been worked on recently, continue executing them step by step.",
+      "interval_minutes": 30,
+      "enabled": false,
+      "last_run": "2026-03-12T15:30:00+00:00"
+    }
+  ]
+}

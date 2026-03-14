@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Avril — local AI assistant" />
+  <!-- Base URL: all relative paths (css/, js/) resolve under /app/ -->
+  <base href="/app/" />
+  <!-- PWA / desktop-app ready: no server-side rendering, pure client JS -->
+  <title>Avril</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────────────────── -->
+<div id="header">
+  <div class="header-left">
+    <span id="header-dot" class="dot dot-unknown" title="connecting…"></span>
+    <span class="header-title">AVRIL</span>
+  </div>
+  <div class="header-right">
+    <button id="auto-btn" class="auto-btn-on" title="Autonomous tasks: ON (click to toggle)">⬢ AUTO</button>
+    <button id="menu-btn" title="Settings">&#8942;</button>
+  </div>
+</div>
+
+<!-- ── App shell ───────────────────────────────────────────────────────── -->
+<div id="app">
+
+  <!-- Chat panel -->
+  <div id="chat-panel">
+
+    <!-- Message history -->
+    <div id="messages"></div>
+
+    <!-- Thinking indicator -->
+    <div id="thinking-bar">
+      <div class="thinking-dots">
+        <span></span><span></span><span></span>
+      </div>
+      Avril is thinking&hellip;
+    </div>
+
+    <!-- Input bar -->
+    <div id="input-bar">
+      <button id="new-chat-btn" title="New chat">+</button>
+      <input
+        id="msg-input"
+        type="text"
+        placeholder="Message Avril&hellip;  (type /help for commands)"
+        autocomplete="off"
+        spellcheck="false"
+        autofocus
+      />
+      <button id="send-btn">Send</button>
+    </div>
+
+  </div><!-- /chat-panel -->
+
+</div><!-- /app -->
+
+<!-- ── Overlay (closes settings panel) ────────────────────────────────── -->
+<div id="overlay"></div>
+
+<!-- ── Settings panel (populated by sidebar.js) ───────────────────────── -->
+<div id="settings-panel"></div>
+
+<!-- ── JS modules (order matters: api → settings → chat → sidebar) ─────── -->
+<script src="js/api.js"></script>
+<script src="js/settings.js"></script>
+<script src="js/chat.js"></script>
+<script src="js/sidebar.js"></script>
+
+<script>
+  // Bootstrap
+  Settings.load();
+  Chat.init();
+  Sidebar.init();
+</script>
+
+</body>
+</html>

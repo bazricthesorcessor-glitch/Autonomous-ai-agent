@@ -1,20 +1,5 @@
 # ========================= core/agent_loop.py =========================
-"""
-Avril's agent loop: plan → tool → observe → respond.
-
-Flow per turn:
-  1. Load ALL in-progress persistent tasks from tasks.json
-  2. Planner (DECISION_MODEL) decides: start_task / task_done / use_tool / respond
-  3. If use_tool: check registry safe/risky gate
-       Safe  → auto-execute, record step in task, inject result into context
-               Retry up to MAX_RETRIES on failure; abort if stuck
-       Risky → block, return confirmation request to user
-  4. Loop detection: repeated identical outputs break the loop early
-  5. Repeat up to MAX_STEPS
-  6. Final response via brain.route() model, with fallback to CHAT_MODEL
-
-Task state survives server restarts — stored in memory/tasks.json.
-"""
+"""Avril's central brain loop: classify → plan → execute → verify → respond."""
 
 import json
 import re
@@ -26,7 +11,7 @@ from core.state import TurnContext, SystemState
 from core import brain
 from core import system_shortcuts
 from tools import registry
-from engines import task_manager
+from engines import task_manager, todo_manager
 
 client = Client(host='http://localhost:11434')
 
@@ -125,10 +110,13 @@ def get_tool_feed() -> list:
     return list(reversed(_TOOL_FEED))
 
 _PLANNER_SYSTEM = """\
-You are Avril's decision engine. Decide the next action for each step.
+You are Avril's central decision engine. Execute the cycle:
+classify intent -> follow the TODO plan -> route to the correct tool -> verify -> finish.
 
 Available tools:
 {tools_desc}
+
+{analysis_block}
 
 {task_block}
 
@@ -143,22 +131,33 @@ Choices:
   Respond now     → {{"decision": "respond",     "reason": "<why no tool needed>"}}
 
 Rules:
+- The request has already been classified. Respect the provided intent category and TODO plan.
+- Treat the TODO plan as the canonical execution checklist. Advance it step by step.
 - Use start_task for ANY multi-step goal (install, fix, configure, automate).
   Include ALL details (passwords, ssid, targets) so nothing is forgotten.
 - task_done requires task_id — always specify which task was completed.
   Only mark done after verifying success (take a screenshot to confirm).
 - Multiple tasks can run in parallel. task_done applies only to the specified task.
-- TOOL PRIORITY (follow this order):
-    1. browser_control — BEST for websites (DOM control, no coordinate guessing)
-    2. window_manager  — open/switch/close apps (fast, reliable)
-    3. terminal_safe   — install packages, run commands, check logs
-    4. system_diagnostics — system info
-    5. screenshot      — read the screen (text only)
-    6. computer_use scan_screen   — desktop app element detection (OCR + bounding boxes)
-    7. computer_use click_map     — click a desktop element from the scan
-    8. computer_use click_element — click using pre-saved pixel position (permanent map)
-    9. computer_use press_key / type_text — keyboard shortcuts, desktop text input
-   10. computer_use click_text    — OCR-based click (last resort)
+- TOOL ROUTING:
+        1. code            — math / computation / formula evaluation
+        2. web             — information lookups and fetches
+        3. browser_control — websites when DOM control is available
+        4. vision          — locate elements, page state, OCR completion detection
+        5. executor        — atomic GUI actions after vision returns coordinates
+        6. window_manager  — open or focus desktop applications
+        7. terminal_safe   — run controlled commands
+        8. screenshot / ui_parser / computer_use — fallback perception or automation layers
+
+VISION RULES:
+- Vision is perception only. It never clicks, types, or controls the mouse.
+- Use vision locate/page_state/wait_ready/monitor_response when you need to inspect the screen.
+- For page loads, poll until state is READY before continuing.
+- For long AI outputs, use monitor_response until the state becomes COMPLETE.
+
+EXECUTOR RULES:
+- GUI actions must be atomic commands executed through executor.
+- Use commands like CLICK x y, TYPE x y text, SCROLL x y down, WAIT 2, PRESS Enter.
+- Vision supplies coordinates; executor performs the action.
 
 WEBSITE AUTOMATION — use browser_control (Playwright, DOM-based):
   For ANY website task (YouTube, Google, Gmail, etc.), ALWAYS use browser_control.
@@ -194,16 +193,19 @@ DESKTOP APP — use window_manager (NOT browser_control):
   Use get_elements to discover what's on a web page:
     {{"decision": "use_tool", "tool": "browser_control", "args": {{"action": "get_elements"}}, "reason": "list page elements"}}
 
-DESKTOP APP AUTOMATION — use computer_use (OCR + ydotool):
-  For apps like VS Code, file manager, settings — use computer_use.
-  Step 1 → computer_use open_url / focus_window
-  Step 2 → computer_use scan_screen   — builds element map with bounding boxes
-  Step 3 → computer_use click_map     — click element by text
-  Step 4 → computer_use type_text / press_key
+DESKTOP APP AUTOMATION — use vision + executor:
+    For apps like VS Code, file manager, settings:
+    Step 1 → window_manager launch/focus the app
+    Step 2 → vision locate the required element or inspect page state
+    Step 3 → executor run atomic GUI commands using returned coordinates
+    Step 4 → vision verify the UI changed as expected
 
 DECISION RULE:
-  Website URL involved? → browser_control (Layer 1)
-  Desktop app?          → computer_use (Layer 3)
+    Computation?          → code
+    Information lookup?   → web
+    Website interaction?  → browser_control first, vision second
+    Desktop GUI?          → vision then executor
+    System/app control?   → terminal_safe or window_manager
 
 Calibrating permanent positions (when user asks to "teach" or "save"):
   save_position  site=X  element=Y  ← saves current mouse pos
@@ -277,7 +279,33 @@ def _parse_json(raw: str) -> dict:
         return {"decision": "respond", "reason": "planner parse error"}
 
 
-def _build_planner_system(tools_desc: str, active_tasks: list) -> str:
+def _sync_initial_todos(plan: list[str]) -> None:
+    if not plan:
+        return
+    todo_manager.clear_all()
+    created = todo_manager.create_items(plan)
+    if created:
+        todo_manager.update_status(created[0]['id'], 'in_progress')
+
+
+def _advance_todo_progress() -> None:
+    active = todo_manager.get_active()
+    in_progress = next((item for item in active if item.get('status') == 'in_progress'), None)
+    if in_progress:
+        todo_manager.update_status(in_progress['id'], 'done')
+
+    active = todo_manager.get_active()
+    next_pending = next((item for item in active if item.get('status') == 'pending'), None)
+    if next_pending:
+        todo_manager.update_status(next_pending['id'], 'in_progress')
+
+
+def _complete_all_todos() -> None:
+    for item in todo_manager.get_active():
+        todo_manager.update_status(item['id'], 'done')
+
+
+def _build_planner_system(tools_desc: str, active_tasks: list, analysis: dict) -> str:
     if active_tasks:
         ctx = task_manager.get_all_tasks_context(active_tasks)
         task_block = f"ACTIVE TASKS (continue working on these):\n{ctx}"
@@ -285,12 +313,26 @@ def _build_planner_system(tools_desc: str, active_tasks: list) -> str:
         task_block = ""
 
     shortcuts_block = system_shortcuts.get_shortcuts_prompt()
+    analysis_block = brain.format_analysis_for_prompt(analysis)
 
     return _PLANNER_SYSTEM.format(
         tools_desc=tools_desc,
+        analysis_block=analysis_block,
         task_block=task_block,
         shortcuts_block=shortcuts_block,
     )
+
+
+def _verify_after_tool(tool_name: str, tool_args: dict) -> str:
+    action = str(tool_args.get('action', '')).strip().lower()
+    if tool_name == 'browser_control' and action == 'open':
+        return registry.run('vision', {
+            'action': 'wait_ready',
+            'mode': 'active_window',
+            'interval': config.PERCEPTION_POLL_INTERVAL,
+            'timeout': 12,
+        })
+    return ""
 
 
 def _is_tool_error(result: str) -> bool:
@@ -315,6 +357,17 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
 
     tools_desc = registry.describe_tools()
     active_tasks = task_manager.get_active_tasks()
+    analysis = brain.analyze_request(user_message)
+
+    if not active_tasks and analysis.get('needs_plan'):
+        task_manager.create_task(
+            title=analysis.get('title', 'Task'),
+            description=user_message,
+            category=analysis.get('category', 'task_request'),
+            plan=analysis.get('todo', []),
+        )
+        _sync_initial_todos(analysis.get('todo', []))
+        active_tasks = task_manager.get_active_tasks()
 
     # ── Fast path: Tier 1 (greeting) or Tier 2 (chat) ───────────────────────
     fast = classify_fast_path(user_message) if not active_tasks else 'agent'
@@ -347,9 +400,9 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
             print(f"[AgentLoop] Fast path ({fast}) error: {e}")
             return f"Sorry, something went wrong: {str(e)}"
 
-    planner_system = _build_planner_system(tools_desc, active_tasks)
+    planner_system = _build_planner_system(tools_desc, active_tasks, analysis)
 
-    working_request = user_message
+    working_request = f"{brain.format_analysis_for_prompt(analysis)}\n\nUser request:\n{user_message}"
 
     consecutive_errors   = 0
     tool_calls_this_turn = 0  # Hard cap counter (BUG 4)
@@ -382,10 +435,14 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
             task_id = task_manager.create_task(
                 title=decision.get('title', 'Task'),
                 description=decision.get('description', user_message),
-                credentials=decision.get('credentials', {})
+                credentials=decision.get('credentials', {}),
+                category=analysis.get('category', 'task_request'),
+                plan=analysis.get('todo', []),
             )
             active_tasks = task_manager.get_active_tasks()
-            planner_system = _build_planner_system(tools_desc, active_tasks)
+            if analysis.get('todo'):
+                _sync_initial_todos(analysis.get('todo', []))
+            planner_system = _build_planner_system(tools_desc, active_tasks, analysis)
             ctx.add_step(decision, f"[Task {task_id} created]")
             working_request += "\n\nTask registered. Now execute it step by step using tools."
             continue
@@ -399,9 +456,10 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
             if tid:
                 summary = decision.get('summary', 'completed')
                 task_manager.complete_task(tid, summary)
+                _complete_all_todos()
                 ctx.add_step(decision, f"[Task {tid} completed: {summary}]")
                 active_tasks = task_manager.get_active_tasks()
-                planner_system = _build_planner_system(tools_desc, active_tasks)
+                planner_system = _build_planner_system(tools_desc, active_tasks, analysis)
             break
 
         # ── Respond directly ─────────────────────────────────────────────────
@@ -449,6 +507,12 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
 
         ctx.add_step(decision, result)
         tool_calls_this_turn += 1
+        _advance_todo_progress()
+
+        verification = _verify_after_tool(tool_name, tool_args)
+        if verification:
+            ctx.add_step({"decision": "verify", "tool": "vision"}, verification)
+            result = f"{result}\n\nVerification:\n{verification}"
 
         # Record in activity feed for UI debugging
         _TOOL_FEED.append({

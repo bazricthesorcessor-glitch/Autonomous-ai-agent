@@ -1,5 +1,27 @@
 import os
 
+# Paths/patterns that should never be read or listed even within home
+_SENSITIVE_PATHS = {
+    '.ssh', '.gnupg', '.gpg', '.password-store',
+    '.aws', '.azure', '.config/gcloud',
+    '.env', '.netrc', '.npmrc', '.pypirc',
+    'auth_info',       # WhatsApp auth session data
+}
+
+
+def _is_sensitive(abspath: str) -> bool:
+    """Return True if the path touches a sensitive directory/file."""
+    parts = abspath.split(os.sep)
+    for part in parts:
+        if part in _SENSITIVE_PATHS:
+            return True
+    # Also block dotfiles that commonly hold credentials
+    basename = os.path.basename(abspath)
+    if basename in ('.env', '.netrc', '.npmrc', '.pypirc'):
+        return True
+    return False
+
+
 class _FileToolInternal:
     """
     The actual logic class.
@@ -14,6 +36,8 @@ class _FileToolInternal:
             # Security Check: Prevent escaping sandbox
             if not target_path.startswith(self.allowed_root):
                 return "Error: Access Denied. Stay inside home directory."
+            if _is_sensitive(target_path):
+                return "Error: Access Denied. This path contains sensitive data."
 
             if not os.path.exists(target_path):
                 return "Error: Path does not exist."
@@ -35,6 +59,8 @@ class _FileToolInternal:
 
             if not target_path.startswith(self.allowed_root):
                 return "Error: Access Denied."
+            if _is_sensitive(target_path):
+                return "Error: Access Denied. This file is in a sensitive location."
 
             # Size Check (50KB limit)
             if os.path.getsize(target_path) > 1024 * 50:

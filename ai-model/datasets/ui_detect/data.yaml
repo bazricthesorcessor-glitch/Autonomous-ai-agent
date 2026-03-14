@@ -1,0 +1,32 @@
+# ========================= data.yaml =========================
+# YOLOv8 dataset config for desktop UI element detection.
+#
+# Class IDs MUST match ui_parser.py _DEFAULT_CLASS_MAP exactly.
+# If you add/remove classes here, update _DEFAULT_CLASS_MAP too.
+#
+# Labeling tools: CVAT (cvat.ai) or Label Studio (labelstud.io)
+#   - Export format: YOLO 1.1  (class_id cx cy w h — normalised)
+# ================================================================
+
+path: .   # resolved relative to this file's directory
+train: train/images
+val: val/images
+
+# 16 classes — order matches ui_parser.py _DEFAULT_CLASS_MAP (IDs 0-15)
+names:
+  0: button
+  1: input
+  2: icon
+  3: menu
+  4: card
+  5: list
+  6: checkbox
+  7: radio
+  8: dropdown
+  9: toggle
+  10: link
+  11: image
+  12: text
+  13: header
+  14: nav
+  15: search_bar

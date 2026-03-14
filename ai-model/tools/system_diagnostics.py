@@ -9,7 +9,7 @@ def run_tool(args):
     """
     try:
         # CPU
-        cpu_load = psutil.cpu_percent(interval=1)
+        cpu_load = psutil.cpu_percent(interval=0.1)
 
         # RAM
         mem = psutil.virtual_memory()

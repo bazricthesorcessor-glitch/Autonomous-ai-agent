@@ -45,6 +45,11 @@ import config
 _SCREENSHOT_PATH = os.path.join(config.SCREENSHOT_DIR, "_ui_parse.png")
 _MAP_CACHE = os.path.join(config.SCREENSHOT_DIR, "screen_map.json")
 
+# Screen resolution — coordinates are in these native pixels.
+# Updated automatically on first capture; set defaults for 1920x1200.
+SCREEN_W = 1920
+SCREEN_H = 1200
+
 # Model path: check config, fallback to default location
 _DEFAULT_MODEL_PATH = os.path.join(config.BASE_DIR, "models", "ui_detect.pt")
 UI_MODEL_PATH = getattr(config, 'UI_MODEL_PATH', _DEFAULT_MODEL_PATH)
@@ -141,11 +146,19 @@ def _get_class_map() -> dict:
 # ── Screenshot capture ────────────────────────────────────────────────────────
 
 def _capture(path: str = None) -> bool:
-    """Capture fullscreen via grim. Returns True on success."""
+    """Capture fullscreen via grim. Updates SCREEN_W/H from the image."""
+    global SCREEN_W, SCREEN_H
     if path is None:
         path = _SCREENSHOT_PATH
     try:
         subprocess.run(["grim", path], check=True, capture_output=True, timeout=8)
+        # Read actual resolution from the captured image
+        try:
+            from PIL import Image
+            with Image.open(path) as img:
+                SCREEN_W, SCREEN_H = img.size
+        except Exception:
+            pass  # keep defaults
         return True
     except Exception:
         return False
@@ -318,6 +331,8 @@ def parse_screen(
             "h": det["h"],
             "cx": cx,
             "cy": cy,
+            "click_x": cx,    # exact pixel to click (screen coords)
+            "click_y": cy,    # exact pixel to click (screen coords)
             "conf": det["confidence"],
         })
 
@@ -328,6 +343,8 @@ def parse_screen(
     cache = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source": "yolo",
+        "screen_w": SCREEN_W,
+        "screen_h": SCREEN_H,
         "count": len(elements),
         "elements": elements,
     }

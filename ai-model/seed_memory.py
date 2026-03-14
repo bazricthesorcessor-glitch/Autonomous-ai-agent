@@ -24,4 +24,4 @@ file_path = os.path.join(MEMORY_DIR, "cacheA.txt")
 with open(file_path, "w") as f:
     f.write(data)
 
-print(f"[Seed] Injected clean test data into {file_path}"
+print(f"[Seed] Injected clean test data into {file_path}")

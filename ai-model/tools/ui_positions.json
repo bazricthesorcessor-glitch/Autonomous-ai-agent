@@ -1,0 +1,24 @@
+{
+  "_note": "Pixel positions calibrated for 1920x1200 with Firefox nearly fullscreen. Run save_position to update any entry.",
+  "_resolution": "1920x1200",
+
+  "youtube.com": {
+    "search_bar":     {"x": 709,  "y": 122, "note": "search input box (centre)"},
+    "search_button":  {"x": 1093, "y": 122, "note": "magnifying glass button"}
+  },
+
+  "google.com": {
+    "search_bar":     {"x": 960,  "y": 430, "note": "main search input"},
+    "search_button":  {"x": 960,  "y": 510, "note": "Google Search button"}
+  },
+
+  "firefox": {
+    "address_bar":    {"x": 736,  "y": 45,  "note": "URL / address bar"},
+    "new_tab_button": {"x": 1870, "y": 20,  "note": "+ new tab button"}
+  },
+
+  "vscode": {
+    "terminal":       {"x": 960,  "y": 950, "note": "integrated terminal area"},
+    "editor":         {"x": 960,  "y": 500, "note": "main editor area"}
+  }
+}
