@@ -51,6 +51,12 @@ PERCEPTION_POLL_INTERVAL = 2.0
 RESPONSE_STABLE_POLLS = 2
 SCREENSHOT_RETENTION_SECONDS = 1800
 
+# === Verification / perception tuning ===
+VERIFY_ACTIONS = True
+MAX_VERIFICATION_FAILURES = 3
+PERCEPTION_TIMEOUT = 12
+MONITOR_RESPONSE_TIMEOUT = 18
+
 # === Helper Functions ===
 def get_today_dir():
     """Returns the path to today's memory folder."""

@@ -5,7 +5,7 @@ FULL CODEBASE EXPORT
 Owner / Pen name: Divyansh (Bazric)
 AI Name: Avril (Satomi)
 Stack: Python (Flask + Ollama) backend | Node.js (Baileys) WhatsApp bot | Vanilla JS UI
-Exported: 2026-03-14 18:31:08
+Exported: 2026-03-15 00:42:29
 ================================================================================
 
 ARCHITECTURE:
@@ -153,10 +153,22 @@ SUMMARY_DAYS_WINDOW = 10    # Keep 10 days of summaries (Day 11-20)
 MAX_RAW_TOKENS_PER_DAY = 8000  # Safety cap per day
 
 # === Model Config (Updated to Phi4-Mini) ===
-DECISION_MODEL = "phi4-mini:3.8b"   # Faster planner/router
-CHAT_MODEL = "phi4-mini:3.8b"       # Fast general chat
-CODE_MODEL = "qwen2.5-coder:7b-instruct-q4_K_M" # Specialist coder
+PRIMARY_MODEL = "phi4-mini:3.8b"    # Single reasoning model for brain + chat
+DECISION_MODEL = PRIMARY_MODEL        # Backward-compatible planner alias
+CHAT_MODEL = PRIMARY_MODEL            # Backward-compatible chat alias
+CODE_MODEL = PRIMARY_MODEL            # Backward-compatible code alias
 EMBED_MODEL = "nomic-embed-text-v2-moe:latest"  # Embeddings
+
+# === Perception / automation tuning ===
+PERCEPTION_POLL_INTERVAL = 2.0
+RESPONSE_STABLE_POLLS = 2
+SCREENSHOT_RETENTION_SECONDS = 1800
+
+# === Verification / perception tuning ===
+VERIFY_ACTIONS = True
+MAX_VERIFICATION_FAILURES = 3
+PERCEPTION_TIMEOUT = 12
+MONITOR_RESPONSE_TIMEOUT = 18
 
 # === Helper Functions ===
 def get_today_dir():
@@ -206,6 +218,9 @@ FILE: ai-model/config/system_config.json  [runtime config]
       "utilities",
       "web",
       "pdf",
+      "code",
+      "vision",
+      "executor",
       "computer_use",
       "browser_control",
       "actions"
@@ -1099,78 +1114,717 @@ setInterval(poll, 5000)
 FILE: ai-model/core/brain.py  [LLM wrapper + model fallback]
 --------------------------------------------------------------------------------
 # ========================= core/brain.py =========================
-"""
-Model router. Maps the user's message to the best Ollama model.
+"""Central brain helpers for AVRIL.
 
-Uses keyword matching — no LLM call, no extra latency.
-Falls back to CHAT_MODEL if nothing matches.
+The brain is responsible for:
+  - classifying user intent
+  - extracting actionable targets from input
+  - generating context-aware structured task plans
+  - recommending tool routing with sub-category awareness
+  - normalizing action commands before execution
+  - selecting the single primary reasoning model
 """
+
+from __future__ import annotations
+
+import re
+import shlex
 
 import config
 
-# ── Keyword sets (lowercase, checked against lowercased input) ────────────────
+# ── Intent categories ────────────────────────────────────────────────────────
 
-_CODE = {
-    "write code", "python code", "script", "debug", "function def",
-    "implement", "algorithm", "syntax error", "bash script", "shell script",
-    "def ", "import ", "traceback", "fix this code", "write a program",
-    "refactor", "compile", "regex", "write a function",
+INTENT_CATEGORIES = (
+    "simple_chat",
+    "homework_question",
+    "task_request",
+    "memory_store",
+    "system_command",
+    "information_lookup",
+    "automation_task",
+)
+
+# ── Keyword hint sets ────────────────────────────────────────────────────────
+
+_SYSTEM_COMMAND_HINTS = {
+    "run", "execute", "terminal", "shell", "command", "install", "service",
+    "systemctl", "journalctl", "nmcli", "git ", "python ", "pip ", "npm ",
+    "launch", "start app", "restart", "stop",
+    "close app", "kill process", "check network", "connect wifi", "disconnect",
+    "close the current window", "close window",
 }
 
-_REASONING = {
-    "solve this math", "logic puzzle", "prove that", "calculate",
-    "equation", "formula", "statistics", "probability",
-    "explain how", "deduce", "what is the difference between",
+_AUTOMATION_HINTS = {
+    "open", "search", "click", "type", "press", "scroll", "navigate",
+    "youtube", "browser", "website", "page", "tab", "gui",
+    "screen", "ocr", "screenshot", "desktop",
+    "play", "video", "watch", "stream", "download", "upload", "bookmark",
+    "fill out", "fill in", "submit", "login", "log in", "sign in", "sign up",
+    "next page", "previous page", "go back", "refresh", "reload",
+    "close tab", "new tab", "switch tab", "what do you see",
 }
 
-_UNCENSORED = {
-    "uncensored", "unrestricted", "no filter", "jailbreak", "dolphin",
+_MEMORY_HINTS = {
+    "remember", "don't forget", "do not forget", "save this", "store this",
+    "my name is", "i like", "i prefer", "my favorite", "note that",
 }
 
-# ── Public API ────────────────────────────────────────────────────────────────
+_LOOKUP_HINTS = {
+    "look up", "lookup", "find information", "find out", "who is", "what is",
+    "when did", "where is", "latest", "news", "search the web", "fetch",
+    "wikipedia", "tell me about", "capital of",
+}
+
+_HOMEWORK_HINTS = {
+    "derivative", "integral", "prove", "equation", "calculate", "solve",
+    "homework", "assignment", "x^", "x\u00b2", "probability", "statistics",
+    "physics", "chemistry", "math", "algebra", "geometry", "multiply",
+}
+
+_SIMPLE_CHAT_HINTS = {
+    "hi", "hello", "hey", "thanks", "thank you", "how are you", "what's up",
+    "who are you", "your name", "good morning", "good night",
+    "tell me a joke", "joke",
+}
+
+_BROWSER_HINTS = {
+    "http://", "https://", "www.", "youtube", "google", "gmail", "wikipedia",
+    "duckduckgo", "web", "browser", "site", "page", "chatgpt", "chat.openai",
+}
+
+_APP_HINTS = {
+    "terminal", "kate", "vscode", "settings", "file manager", "app",
+    "application", "firefox", "chrome",
+}
+
+# Sub-routing hints for automation_task ────────────────────────────────────────
+
+_VISION_ACTION_HINTS = {
+    "click the", "click on the", "tap the", "press the button",
+    "select the", "choose the", "pick the",
+    "first", "second", "third", "fourth", "fifth",
+    "1st", "2nd", "3rd", "4th", "5th",
+    "that button", "that link", "that video", "that image",
+    "what do you see", "what's on the screen", "what is on screen",
+    "type hello", "type in the",
+}
+
+_DOM_ACTION_HINTS = {
+    "search youtube", "search google", "search for",
+    "open youtube", "open google", "open gmail", "open chatgpt",
+    "open wikipedia", "open duckduckgo",
+    "type in the search", "fill in", "enter text",
+    "submit the form", "log in to", "sign in to",
+    "download this", "download the",
+}
+
+# ── Regex patterns ───────────────────────────────────────────────────────────
+
+_MATH_EXPR_RE = re.compile(r"(?<!\w)(?:\d+(?:\.\d+)?|[()+\-*/%]|\*\*)+(?!\w)")
+
+_URL_RE = re.compile(r'https?://\S+')
+
+_SEARCH_QUERY_RE = re.compile(
+    r'search\s+(?:on\s+)?(?:youtube|google|the\s+web|duckduckgo|wikipedia)?\s*'
+    r'(?:for\s+)?(.+)',
+    re.IGNORECASE,
+)
+
+_CLICK_RE = re.compile(
+    r'click\s+(?:on\s+)?(?:the\s+)?(.+)',
+    re.IGNORECASE,
+)
+
+_OPEN_SITE_RE = re.compile(
+    r'open\s+(?:up\s+)?(\S+)',
+    re.IGNORECASE,
+)
+
+_ORDINAL_RE = re.compile(
+    r'(first|second|third|fourth|fifth|\d+(?:st|nd|rd|th))\s+(.+)',
+    re.IGNORECASE,
+)
+
+# ── Site-to-URL mapping ─────────────────────────────────────────────────────
+
+_SITE_URLS = {
+    "youtube": "https://youtube.com",
+    "google": "https://google.com",
+    "gmail": "https://mail.google.com",
+    "wikipedia": "https://en.wikipedia.org",
+    "duckduckgo": "https://duckduckgo.com",
+    "github": "https://github.com",
+    "chatgpt": "https://chat.openai.com",
+    "reddit": "https://reddit.com",
+    "twitter": "https://twitter.com",
+    "x": "https://x.com",
+}
+
+# ── Action command normalization ─────────────────────────────────────────────
+
+_ACTION_CMD_RE = re.compile(
+    r'^(CLICK|TYPE|SCROLL|WAIT|PRESS|MOVE)\s+(.+)$',
+    re.IGNORECASE,
+)
+
+
+def normalize_action_command(raw_command: str) -> str | None:
+    """Validate and normalize an action command string.
+
+    Returns the normalized command string, or None if invalid.
+
+    Valid formats:
+        CLICK x y
+        TYPE x y text
+        SCROLL x y up|down [amount]
+        WAIT seconds
+        PRESS key
+        MOVE x y
+    """
+    raw = raw_command.strip()
+    match = _ACTION_CMD_RE.match(raw)
+    if not match:
+        return None
+
+    op = match.group(1).upper()
+    rest = match.group(2).strip()
+
+    try:
+        parts = shlex.split(rest)
+    except ValueError:
+        parts = rest.split()
+
+    if not parts:
+        return None
+
+    if op in ("CLICK", "MOVE") and len(parts) >= 2:
+        try:
+            x, y = int(parts[0]), int(parts[1])
+            return f"{op} {x} {y}"
+        except ValueError:
+            return None
+
+    if op == "TYPE" and len(parts) >= 3:
+        try:
+            x, y = int(parts[0]), int(parts[1])
+            # Everything after x y is the text
+            text = rest.split(None, 2)[2] if len(rest.split(None, 2)) > 2 else ""
+            if not text:
+                return None
+            return f"TYPE {x} {y} {text}"
+        except (ValueError, IndexError):
+            return None
+
+    if op == "SCROLL" and len(parts) >= 3:
+        try:
+            x, y = int(parts[0]), int(parts[1])
+            direction = parts[2].lower()
+            if direction not in ("up", "down"):
+                return None
+            amount = int(parts[3]) if len(parts) > 3 else 3
+            return f"SCROLL {x} {y} {direction} {amount}"
+        except ValueError:
+            return None
+
+    if op == "WAIT" and len(parts) >= 1:
+        try:
+            seconds = float(parts[0])
+            return f"WAIT {seconds}"
+        except ValueError:
+            return None
+
+    if op == "PRESS" and len(parts) >= 1:
+        return f"PRESS {parts[0]}"
+
+    return None
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _contains_any(message: str, words: set[str]) -> bool:
+    return any(token in message for token in words)
+
+
+def _contains_any_word(message: str, words: set[str]) -> bool:
+    """Match whole phrases/words — avoids substring false positives like 'hi' in 'third'."""
+    for token in words:
+        # Multi-word phrases: direct substring match is fine (specific enough)
+        if " " in token:
+            if token in message:
+                return True
+        else:
+            # Single-word tokens: require word boundary
+            if re.search(r'(?:^|\s)' + re.escape(token) + r'(?:\s|$|[!?.,])', message):
+                return True
+    return False
+
+
+# ── Intent classification ────────────────────────────────────────────────────
+
+def classify_intent(user_input: str) -> str:
+    """Classify a user message into one of the supported brain categories."""
+    msg = user_input.strip().lower()
+    if not msg:
+        return "simple_chat"
+
+    # Simple chat FIRST — catches greetings, "how are you", "tell me a joke"
+    # Uses word-boundary matching to avoid false positives (e.g., "hi" in "third")
+    # BUT: skip if the message contains action verbs (e.g., "type hello" is automation)
+    _ACTION_VERBS = {
+        "click", "type", "press", "scroll", "open", "search", "download",
+        "navigate", "close", "launch", "run", "install", "execute", "submit",
+    }
+    has_action_verb = _contains_any_word(msg, _ACTION_VERBS)
+    if not has_action_verb and _contains_any_word(msg, _SIMPLE_CHAT_HINTS):
+        return "simple_chat"
+    if _contains_any(msg, _MEMORY_HINTS):
+        return "memory_store"
+
+    # Desktop app launch/close → system_command (before automation catches "open")
+    if _contains_any(msg, _APP_HINTS):
+        return "system_command"
+    if _contains_any(msg, _SYSTEM_COMMAND_HINTS):
+        return "system_command"
+
+    if _contains_any(msg, _AUTOMATION_HINTS):
+        return "automation_task"
+    if _contains_any(msg, _HOMEWORK_HINTS) or _MATH_EXPR_RE.search(msg):
+        return "homework_question"
+    if _contains_any(msg, _LOOKUP_HINTS) or msg.startswith(("who ", "what ", "when ", "where ", "why ", "how ")):
+        return "information_lookup"
+    return "task_request"
+
+
+# ── Target extraction ────────────────────────────────────────────────────────
+
+def _extract_targets(user_input: str) -> dict:
+    """Extract actionable targets from user input using regex patterns.
+
+    Returns:
+        {
+            "url": str | None,
+            "app": str | None,
+            "search_query": str | None,
+            "click_target": str | None,
+            "site": str | None,
+        }
+    """
+    msg = user_input.strip()
+    msg_lower = msg.lower()
+
+    targets = {
+        "url": None,
+        "app": None,
+        "search_query": None,
+        "click_target": None,
+        "site": None,
+    }
+
+    # Extract explicit URL
+    url_match = _URL_RE.search(msg)
+    if url_match:
+        targets["url"] = url_match.group(0)
+
+    # Detect site name
+    for site_name in _SITE_URLS:
+        if site_name in msg_lower:
+            targets["site"] = site_name
+            if not targets["url"]:
+                targets["url"] = _SITE_URLS[site_name]
+            break
+
+    # Extract search query
+    search_match = _SEARCH_QUERY_RE.search(msg)
+    if search_match:
+        targets["search_query"] = search_match.group(1).strip().rstrip(".!?")
+
+    # Extract click target
+    click_match = _CLICK_RE.search(msg)
+    if click_match:
+        targets["click_target"] = click_match.group(1).strip().rstrip(".!?")
+
+    # Extract app name (only if not a browser site)
+    if not targets["site"] and not targets["url"]:
+        open_match = _OPEN_SITE_RE.search(msg)
+        if open_match:
+            candidate = open_match.group(1).strip().lower()
+            # Check if it's a known site
+            if candidate in _SITE_URLS:
+                targets["site"] = candidate
+                targets["url"] = _SITE_URLS[candidate]
+            elif _contains_any(candidate, _APP_HINTS) or candidate in {
+                "firefox", "chrome", "kate", "dolphin", "konsole",
+                "thunar", "nautilus", "gedit", "code", "vscode",
+            }:
+                targets["app"] = candidate
+
+    return targets
+
+
+# ── Task title ───────────────────────────────────────────────────────────────
+
+def build_task_title(user_input: str, category: str | None = None) -> str:
+    """Create a short task title from the request."""
+    category = category or classify_intent(user_input)
+    cleaned = re.sub(r"\s+", " ", user_input).strip(" .,!?")
+    if not cleaned:
+        return "Task"
+    words = cleaned.split()
+    title = " ".join(words[:6])
+    if category == "automation_task":
+        return f"Automate: {title}"
+    if category == "system_command":
+        return f"System: {title}"
+    if category == "homework_question":
+        return f"Solve: {title}"
+    return title
+
+
+# ── Context-aware plan generators ────────────────────────────────────────────
+
+def _browser_plan_contextual(user_input: str, targets: dict) -> list[str]:
+    """Generate a context-aware browser automation plan."""
+    steps = []
+    site = targets.get("site")
+    url = targets.get("url") or _SITE_URLS.get(site or "", "")
+    search_query = targets.get("search_query")
+    click_target = targets.get("click_target")
+
+    if url:
+        steps.append(f"open {url} using browser_control")
+        steps.append("wait for page to reach READY state")
+    else:
+        steps.append("open the target website using browser_control")
+        steps.append("wait for page to reach READY state")
+
+    if search_query:
+        steps.append("locate the search input field")
+        steps.append(f"type '{search_query}' into the search field")
+        steps.append("press Enter to submit the search")
+        steps.append("wait for results page to reach READY state")
+
+    if click_target:
+        steps.append(f"locate '{click_target}' on the page")
+        steps.append("click the target element")
+
+    steps.append("verify the visible result matches the request")
+    return steps
+
+
+def _system_plan_contextual(user_input: str, targets: dict) -> list[str]:
+    """Generate a context-aware system command plan."""
+    app = targets.get("app")
+    msg_lower = user_input.strip().lower()
+
+    if "screenshot" in msg_lower:
+        return [
+            "capture current screen using screenshot tool",
+            "store screenshot result",
+            "return the captured data",
+        ]
+
+    if "close" in msg_lower or "kill" in msg_lower:
+        return [
+            "identify the target window or process",
+            "send close/kill command via window_manager",
+            "verify the window/process is gone",
+        ]
+
+    if "stop" in msg_lower and ("everything" in msg_lower or "all" in msg_lower):
+        return [
+            "identify all running tasks",
+            "cancel active tasks",
+            "confirm shutdown",
+        ]
+
+    if app:
+        return [
+            f"check if {app} is already running",
+            f"launch {app} using window_manager",
+            f"verify {app} window opened",
+        ]
+
+    return [
+        "inspect the target application or command context",
+        "run the required safe command or launch action",
+        "capture the system output or window state",
+        "verify the requested change completed successfully",
+    ]
+
+
+def _gui_action_plan(user_input: str, targets: dict) -> list[str]:
+    """Plan for non-browser GUI automation (vision + executor)."""
+    click_target = targets.get("click_target")
+    search_query = targets.get("search_query")
+    msg_lower = user_input.strip().lower()
+
+    steps = ["capture current screen state (screenshot + OCR)"]
+
+    if click_target:
+        # Check for ordinal reference
+        ordinal_match = _ORDINAL_RE.search(click_target)
+        if ordinal_match:
+            ordinal, element = ordinal_match.group(1), ordinal_match.group(2)
+            steps.append(f"scan screen for list of {element.strip()} elements")
+            steps.append(f"identify the {ordinal} element position")
+            steps.append("click the target element via executor")
+        else:
+            steps.append(f"locate '{click_target}' using vision.locate")
+            steps.append("click at returned coordinates via executor")
+    elif search_query or "type" in msg_lower:
+        steps.append("locate the target input field using vision.locate")
+        steps.append("click the input field via executor")
+        text = search_query or "the requested text"
+        steps.append(f"type '{text}' via executor")
+    elif "scroll" in msg_lower:
+        steps.append("identify the active window or scroll area")
+        steps.append("execute scroll action via executor")
+        steps.append("verify the screen content has shifted")
+        return steps
+    else:
+        steps.append("analyze visible elements to identify the action target")
+        steps.append("locate the required UI element using vision.locate")
+        steps.append("execute the atomic GUI action via executor")
+
+    steps.append("capture post-action screenshot and verify change")
+    return steps
+
+
+def _lookup_plan(user_input: str) -> list[str]:
+    return [
+        "search the relevant information source",
+        "retrieve and extract the answer",
+        "present a concise explanation",
+    ]
+
+
+def _homework_plan(user_input: str) -> list[str]:
+    return [
+        "interpret the mathematical expression or problem",
+        "compute the result using the python execution tool",
+        "present the answer with explanation",
+    ]
+
+
+def _memory_plan(user_input: str) -> list[str]:
+    return [
+        "extract the important fact from the message",
+        "store the fact in memory",
+        "confirm the stored data",
+    ]
+
+
+# ── Plan generation ──────────────────────────────────────────────────────────
+
+def generate_todo_plan(user_input: str, category: str | None = None) -> list[str]:
+    """Generate a structured step-by-step plan for actionable requests."""
+    category = category or classify_intent(user_input)
+    targets = _extract_targets(user_input)
+
+    if category == "automation_task":
+        msg_lower = user_input.strip().lower()
+        # Browser-based tasks
+        if _contains_any(msg_lower, _BROWSER_HINTS) or _contains_any(msg_lower, _DOM_ACTION_HINTS):
+            return _browser_plan_contextual(user_input, targets)
+        # GUI / vision-based tasks
+        return _gui_action_plan(user_input, targets)
+
+    if category == "system_command":
+        return _system_plan_contextual(user_input, targets)
+    if category == "information_lookup":
+        return _lookup_plan(user_input)
+    if category == "homework_question":
+        return _homework_plan(user_input)
+    if category == "memory_store":
+        return _memory_plan(user_input)
+    if category == "task_request":
+        return [
+            "understand the requested goal and constraints",
+            "select the best tool or subsystem for the next step",
+            "execute the next step",
+            "verify progress toward the goal",
+        ]
+    return []
+
+
+# ── Tool routing ─────────────────────────────────────────────────────────────
+
+def recommend_tool(user_input: str, category: str | None = None) -> str:
+    """Return the best initial tool family for the request."""
+    msg = user_input.lower()
+    category = category or classify_intent(user_input)
+
+    if category == "homework_question":
+        return "code"
+
+    if category == "information_lookup":
+        return "web"
+
+    if category == "system_command":
+        if "screenshot" in msg or "take a screenshot" in msg:
+            return "screenshot"
+        if "stop everything" in msg or "stop all" in msg:
+            return "task_manager"
+        if "close" in msg and ("window" in msg or "app" in msg):
+            return "window_manager"
+        if _contains_any(msg, _APP_HINTS):
+            return "window_manager"
+        return "terminal_safe"
+
+    if category == "automation_task":
+        # Sub-routing: app launch vs vision vs browser_control
+        if "screenshot" in msg or "take a screenshot" in msg:
+            return "screenshot"
+        if _contains_any(msg, _APP_HINTS) and not _contains_any(msg, _BROWSER_HINTS):
+            return "window_manager"
+        if _contains_any(msg, _VISION_ACTION_HINTS):
+            return "vision"
+        if _contains_any(msg, _BROWSER_HINTS) or _contains_any(msg, _DOM_ACTION_HINTS):
+            return "browser_control"
+        # Scroll, generic GUI
+        if "scroll" in msg:
+            return "computer_use"
+        return "vision"
+
+    if category == "memory_store":
+        return "utilities"
+
+    return ""
+
+
+# ── Execution notes ──────────────────────────────────────────────────────────
+
+def _build_execution_notes(user_input: str, category: str, preferred_tool: str) -> str:
+    """Generate a 1-sentence execution approach note."""
+    msg_lower = user_input.strip().lower()
+
+    if category == "simple_chat":
+        return "Respond conversationally."
+
+    if category == "homework_question":
+        return "Use python execution tool for computation if needed."
+
+    if category == "information_lookup":
+        return "Use web search tool to find the answer."
+
+    if category == "memory_store":
+        return "Extract the fact and write to facts.json."
+
+    if category == "system_command":
+        if preferred_tool == "screenshot":
+            return "Use screenshot tool to capture current screen."
+        if preferred_tool == "task_manager":
+            return "Stop all active tasks safely."
+        if preferred_tool == "window_manager":
+            return "Use hyprctl or window_manager commands."
+        return "Use terminal_safe for controlled command execution."
+
+    if category == "automation_task":
+        if preferred_tool == "browser_control":
+            site = ""
+            for s in _SITE_URLS:
+                if s in msg_lower:
+                    site = s
+                    break
+            if site:
+                return f"Use browser_control DOM automation for {site}."
+            return "Use browser_control for DOM-based web automation."
+        if preferred_tool == "vision":
+            return "Vision model returns coordinates, executor performs the action."
+        if preferred_tool == "computer_use":
+            return "Use computer_use for direct GUI interaction."
+        return "Use vision for perception, executor for actions."
+
+    return "Select appropriate tool and execute step by step."
+
+
+# ── Main analysis entry point ────────────────────────────────────────────────
+
+def analyze_request(user_input: str) -> dict:
+    """Build the initial decision packet used by the agent loop.
+
+    Returns a structured analysis with:
+        category, task_title, preferred_tool, todo_plan,
+        needs_plan, execution_notes, uses_browser
+    """
+    category = classify_intent(user_input)
+    todo_plan = generate_todo_plan(user_input, category)
+    preferred_tool = recommend_tool(user_input, category)
+    execution_notes = _build_execution_notes(user_input, category, preferred_tool)
+    needs_plan = category in {
+        "automation_task", "system_command", "task_request",
+        "information_lookup", "homework_question", "memory_store",
+    }
+    return {
+        "category": category,
+        "task_title": build_task_title(user_input, category),
+        "preferred_tool": preferred_tool,
+        "todo_plan": todo_plan,
+        "needs_plan": needs_plan and bool(todo_plan),
+        "execution_notes": execution_notes,
+        "uses_browser": _contains_any(user_input.lower(), _BROWSER_HINTS),
+    }
+
+
+def format_analysis_for_prompt(analysis: dict) -> str:
+    """Serialize the initial brain analysis into prompt-friendly text."""
+    todo = analysis.get("todo_plan", analysis.get("todo", []))
+    todo_block = "\n".join(f"  {i + 1}. {step}" for i, step in enumerate(todo)) or "  (none)"
+    preferred_tool = analysis.get("preferred_tool") or "none"
+    execution_notes = analysis.get("execution_notes", "")
+    return (
+        "BRAIN ANALYSIS\n"
+        f"Intent category: {analysis.get('category', 'task_request')}\n"
+        f"Preferred tool: {preferred_tool}\n"
+        f"Needs structured plan: {bool(analysis.get('needs_plan'))}\n"
+        f"Execution approach: {execution_notes}\n"
+        "TODO plan:\n"
+        f"{todo_block}"
+    )
+
+
+# ── Model routing ────────────────────────────────────────────────────────────
 
 def route(user_input: str) -> str:
-    """
-    Return the model name best suited for this message.
-    Pure keyword matching — O(n) in keyword set size, no network call.
-    """
-    msg = user_input.lower()
-
-    if any(k in msg for k in _UNCENSORED):
-        return config.CHAT_MODEL          # was hardcoded dolphin-mistral
-
-    if any(k in msg for k in _CODE):
-        return config.CODE_MODEL
-
-    if any(k in msg for k in _REASONING):
-        return config.CODE_MODEL          # was hardcoded phi3:latest
-
-    return config.CHAT_MODEL
+    """Return AVRIL's single primary reasoning model."""
+    _ = user_input
+    return config.PRIMARY_MODEL
 
 
 def initialize_brain():
-    print("[Brain] Keyword router ready.")
+    print(f"[Brain] Primary model ready: {config.PRIMARY_MODEL}")
+
+
+# ── Training examples (reference/validation dataset) ─────────────────────────
+
+TRAINING_EXAMPLES = [
+    {"input": "hi", "category": "simple_chat", "preferred_tool": "", "needs_plan": False},
+    {"input": "How are you?", "category": "simple_chat", "preferred_tool": "", "needs_plan": False},
+    {"input": "What is the derivative of x^2?", "category": "homework_question", "preferred_tool": "code", "needs_plan": True},
+    {"input": "Calculate 572 * 941", "category": "homework_question", "preferred_tool": "code", "needs_plan": True},
+    {"input": "Open YouTube", "category": "automation_task", "preferred_tool": "browser_control", "needs_plan": True},
+    {"input": "Search YouTube for lofi music", "category": "automation_task", "preferred_tool": "browser_control", "needs_plan": True},
+    {"input": "Open Firefox", "category": "system_command", "preferred_tool": "window_manager", "needs_plan": True},
+    {"input": "Close the current window", "category": "system_command", "preferred_tool": "window_manager", "needs_plan": True},
+    {"input": "Remember that my exam is on Monday", "category": "memory_store", "preferred_tool": "utilities", "needs_plan": True},
+    {"input": "What is the capital of France?", "category": "information_lookup", "preferred_tool": "web", "needs_plan": True},
+    {"input": "Take a screenshot", "category": "automation_task", "preferred_tool": "screenshot", "needs_plan": True},
+    {"input": "Scroll down", "category": "automation_task", "preferred_tool": "computer_use", "needs_plan": True},
+    {"input": "Search Google for weather in Delhi", "category": "automation_task", "preferred_tool": "browser_control", "needs_plan": True},
+    {"input": "Tell me a joke", "category": "simple_chat", "preferred_tool": "", "needs_plan": False},
+    {"input": "Open ChatGPT website", "category": "automation_task", "preferred_tool": "browser_control", "needs_plan": True},
+    {"input": "Type hello in the search box", "category": "automation_task", "preferred_tool": "vision", "needs_plan": True},
+    {"input": "Click the third video", "category": "automation_task", "preferred_tool": "vision", "needs_plan": True},
+    {"input": "Download this PDF", "category": "automation_task", "preferred_tool": "browser_control", "needs_plan": True},
+    {"input": "What do you see on the screen?", "category": "automation_task", "preferred_tool": "vision", "needs_plan": True},
+    {"input": "Stop everything you are doing", "category": "system_command", "preferred_tool": "task_manager", "needs_plan": True},
+]
 
 --------------------------------------------------------------------------------
 FILE: ai-model/core/agent_loop.py  [2-tier fast path + plan-tool-respond]
 --------------------------------------------------------------------------------
 # ========================= core/agent_loop.py =========================
-"""
-Avril's agent loop: plan → tool → observe → respond.
-
-Flow per turn:
-  1. Load ALL in-progress persistent tasks from tasks.json
-  2. Planner (DECISION_MODEL) decides: start_task / task_done / use_tool / respond
-  3. If use_tool: check registry safe/risky gate
-       Safe  → auto-execute, record step in task, inject result into context
-               Retry up to MAX_RETRIES on failure; abort if stuck
-       Risky → block, return confirmation request to user
-  4. Loop detection: repeated identical outputs break the loop early
-  5. Repeat up to MAX_STEPS
-  6. Final response via brain.route() model, with fallback to CHAT_MODEL
-
-Task state survives server restarts — stored in memory/tasks.json.
-"""
+"""Avril's central brain loop: classify -> plan -> execute -> verify -> respond."""
 
 import json
 import re
@@ -1182,20 +1836,20 @@ from core.state import TurnContext, SystemState
 from core import brain
 from core import system_shortcuts
 from tools import registry
-from engines import task_manager
+from engines import task_manager, todo_manager
 
 client = Client(host='http://localhost:11434')
 
-MAX_STEPS             = 8    # Raised from 3 — needed for real multi-step tasks
+MAX_STEPS             = 8    # Raised from 3 -- needed for real multi-step tasks
 MAX_RETRIES           = 3    # Max consecutive retries on a failing tool
-MAX_TOOL_CALLS_PER_TURN = 5  # Hard cap on tool calls per turn — prevents tool spam
+MAX_TOOL_CALLS_PER_TURN = 5  # Hard cap on tool calls per turn -- prevents tool spam
 _LOOP_DETECT          = 3    # Abort if this many consecutive results are identical
 
-# ── Fast path: conversational bypass ─────────────────────────────────────────
+# == Fast path: conversational bypass =========================================
 # Two tiers of fast path:
-#   Tier 1 — GREETING: ultra-short greetings / acks → minimal prompt, no context
-#   Tier 2 — CHAT:     short knowledge questions / opinions (no action intent)
-#             → persona + memory context, but skip the planner LLM call
+#   Tier 1 -- GREETING: ultra-short greetings / acks -> minimal prompt, no context
+#   Tier 2 -- CHAT:     short knowledge questions / opinions (no action intent)
+#             -> persona + memory context, but skip the planner LLM call
 #
 # Both tiers skip the planner (DECISION_MODEL) entirely, saving one Ollama
 # round-trip.  Tier 1 also skips context building + embedding.
@@ -1249,9 +1903,9 @@ def classify_fast_path(user_message: str) -> str:
     """Classify whether this message can skip the planner.
 
     Returns:
-        'greeting' — Tier 1: skip planner + context (ultra-fast)
-        'chat'     — Tier 2: skip planner, but use persona + memory context
-        'agent'    — needs the full planner → tool → respond loop
+        'greeting' -- Tier 1: skip planner + context (ultra-fast)
+        'chat'     -- Tier 2: skip planner, but use persona + memory context
+        'agent'    -- needs the full planner -> tool -> respond loop
     """
     msg = user_message.strip()
     if len(msg) > _FAST_PATH_MAX_LEN:
@@ -1271,7 +1925,7 @@ def is_conversational_bypass(user_message: str) -> bool:
     Exported so api_server can skip context building + embedding for greetings."""
     return classify_fast_path(user_message) == 'greeting'
 
-# ── Tool Activity Feed ────────────────────────────────────────────────────────
+# == Tool Activity Feed ========================================================
 # In-memory circular buffer of recent tool calls (resets on server restart).
 _TOOL_FEED: deque = deque(maxlen=50)
 
@@ -1280,94 +1934,253 @@ def get_tool_feed() -> list:
     """Return recent tool activity as a list of dicts, newest first."""
     return list(reversed(_TOOL_FEED))
 
+
+# == Perception & Verification =================================================
+
+# Tools that require post-action perception polling
+_PERCEPTION_TOOLS = {
+    "browser_control": {"open", "click", "type", "press", "scroll"},
+    "executor":        {"*"},       # all executor actions need verification
+    "window_manager":  {"open", "launch_app", "focus_window"},
+}
+
+# Actions that trigger long-running responses (need monitor_response)
+_LONG_RESPONSE_ACTIONS = {
+    ("browser_control", "type"),
+    ("executor", "TYPE"),
+}
+
+
+def _needs_perception(tool_name: str, tool_args: dict) -> bool:
+    """Check if this tool+action combination needs post-action perception."""
+    if not config.VERIFY_ACTIONS:
+        return False
+    actions = _PERCEPTION_TOOLS.get(tool_name)
+    if actions is None:
+        return False
+    if "*" in actions:
+        return True
+    action = str(tool_args.get("action", tool_args.get("command", ""))).strip().lower()
+    # For executor, also check the first word of the command string
+    if tool_name == "executor":
+        cmd = str(tool_args.get("command", "")).strip()
+        if cmd:
+            action = cmd.split()[0].lower() if cmd.split() else ""
+    return action in actions
+
+
+def _capture_screen_hash() -> str:
+    """Take a screenshot and return the screen hash for comparison."""
+    try:
+        registry.run("screenshot", {"mode": "active_window"})
+        cache = config.safe_load_json(config.SCREEN_CACHE_FILE, {})
+        return cache.get("screen_hash", "")
+    except Exception:
+        return ""
+
+
+def _perceive_after_action(tool_name: str, tool_args: dict, ctx: TurnContext) -> str:
+    """Post-action perception: wait for page state, verify change occurred.
+
+    Returns a perception summary string (empty if no perception needed).
+    """
+    if not _needs_perception(tool_name, tool_args):
+        return ""
+
+    ctx.state = SystemState.PERCEIVING
+    action = str(tool_args.get("action", "")).strip().lower()
+
+    # Phase A: Wait for page to stabilize
+    wait_result = registry.run("vision", {
+        "action": "wait_ready",
+        "mode": "active_window",
+        "interval": config.PERCEPTION_POLL_INTERVAL,
+        "timeout": config.PERCEPTION_TIMEOUT,
+    })
+
+    # Phase B: For long-response actions, also monitor text stability
+    if _is_long_response_context(tool_name, tool_args):
+        monitor_result = registry.run("vision", {
+            "action": "monitor_response",
+            "mode": "active_window",
+            "interval": config.PERCEPTION_POLL_INTERVAL,
+            "stable_polls": config.RESPONSE_STABLE_POLLS,
+            "timeout": config.MONITOR_RESPONSE_TIMEOUT,
+        })
+        return f"Page state: {wait_result}\nResponse monitor: {monitor_result}"
+
+    return f"Page state: {wait_result}"
+
+
+def _verify_action_effect(
+    pre_hash: str,
+    tool_name: str,
+    tool_args: dict,
+    ctx: TurnContext,
+) -> tuple[bool, str]:
+    """Compare pre/post screenshots to verify the action had an effect.
+
+    Returns (changed: bool, verification_summary: str).
+    """
+    if not _needs_perception(tool_name, tool_args):
+        return True, ""
+
+    post_hash = _capture_screen_hash()
+
+    if not pre_hash or not post_hash:
+        return True, "[verification: screenshot unavailable]"
+
+    changed = (pre_hash != post_hash)
+    if changed:
+        return True, "[verification: screen changed - action successful]"
+    else:
+        ctx.verification_failures += 1
+        return False, "[verification: screen UNCHANGED - action may have failed]"
+
+
+def _is_long_response_context(tool_name: str, tool_args: dict) -> bool:
+    """Heuristic: detect if the current action might trigger a long-running output."""
+    action = str(tool_args.get("action", "")).lower()
+
+    # Direct match on known long-response action pairs
+    if (tool_name, action) in _LONG_RESPONSE_ACTIONS:
+        return True
+
+    # Heuristic: pressing Enter after typing in an AI/chat context
+    if action == "press" and str(tool_args.get("key", "")).lower() in ("enter", "return"):
+        try:
+            cache = config.safe_load_json(config.SCREEN_CACHE_FILE, {})
+            text = (cache.get("last_screen_text", "") or "").lower()
+            ai_indicators = {
+                "chatgpt", "claude", "gemini", "copilot",
+                "send a message", "ask anything", "type a message",
+            }
+            if any(ind in text for ind in ai_indicators):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+# == Planner System Prompt =====================================================
+
 _PLANNER_SYSTEM = """\
-You are Avril's decision engine. Decide the next action for each step.
+You are Avril's central decision engine. Execute the cycle:
+classify intent -> follow the TODO plan -> route to the correct tool -> verify -> finish.
 
 Available tools:
 {tools_desc}
+
+{analysis_block}
 
 {task_block}
 
 {shortcuts_block}
 
-Reply with VALID JSON only — no text outside the JSON.
+Reply with VALID JSON only -- no text outside the JSON.
 
 Choices:
-  Use a tool      → {{"decision": "use_tool",   "tool": "<name>", "args": {{...}}, "reason": "<why>"}}
-  Start new task  → {{"decision": "start_task",  "title": "<short title>", "description": "<full goal including all details>", "credentials": {{"wifi_password": "...", "etc": "..."}}}}
-  Task complete   → {{"decision": "task_done",   "task_id": "<id>", "summary": "<what was done>"}}
-  Respond now     → {{"decision": "respond",     "reason": "<why no tool needed>"}}
+  Use a tool      -> {{"decision": "use_tool",   "tool": "<name>", "args": {{...}}, "reason": "<why>"}}
+  Start new task  -> {{"decision": "start_task",  "title": "<short title>", "description": "<full goal including all details>", "credentials": {{"wifi_password": "...", "etc": "..."}}}}
+  Task complete   -> {{"decision": "task_done",   "task_id": "<id>", "summary": "<what was done>"}}
+  Respond now     -> {{"decision": "respond",     "reason": "<why no tool needed>"}}
 
 Rules:
+- The request has already been classified. Respect the provided intent category and TODO plan.
+- Treat the TODO plan as the canonical execution checklist. Advance it step by step.
 - Use start_task for ANY multi-step goal (install, fix, configure, automate).
   Include ALL details (passwords, ssid, targets) so nothing is forgotten.
-- task_done requires task_id — always specify which task was completed.
+- task_done requires task_id -- always specify which task was completed.
   Only mark done after verifying success (take a screenshot to confirm).
 - Multiple tasks can run in parallel. task_done applies only to the specified task.
-- TOOL PRIORITY (follow this order):
-    1. browser_control — BEST for websites (DOM control, no coordinate guessing)
-    2. window_manager  — open/switch/close apps (fast, reliable)
-    3. terminal_safe   — install packages, run commands, check logs
-    4. system_diagnostics — system info
-    5. screenshot      — read the screen (text only)
-    6. computer_use scan_screen   — desktop app element detection (OCR + bounding boxes)
-    7. computer_use click_map     — click a desktop element from the scan
-    8. computer_use click_element — click using pre-saved pixel position (permanent map)
-    9. computer_use press_key / type_text — keyboard shortcuts, desktop text input
-   10. computer_use click_text    — OCR-based click (last resort)
+- TOOL ROUTING:
+        1. code            -- math / computation / formula evaluation
+        2. web             -- information lookups and fetches
+        3. browser_control -- websites when DOM control is available
+        4. vision          -- locate elements, page state, OCR completion detection
+        5. executor        -- atomic GUI actions after vision returns coordinates
+        6. window_manager  -- open or focus desktop applications
+        7. terminal_safe   -- run controlled commands
+        8. screenshot / ui_parser / computer_use -- fallback perception or automation layers
 
-WEBSITE AUTOMATION — use browser_control (Playwright, DOM-based):
+VISION RULES (READ-ONLY -- vision NEVER performs actions):
+- Vision is strictly a perception interface. It returns data. It never clicks, types, scrolls, or controls the mouse/keyboard.
+- Use vision locate to get coordinates: returns {{"coordinates": [x, y], "state": "FOUND"|"NOT_FOUND"}}
+- Use vision page_state to check if a page is LOADING/READY/ERROR.
+- Use vision wait_ready to block until the page is READY.
+- Use vision monitor_response to block until text output stops changing.
+- After vision returns coordinates, issue the action through executor (e.g., CLICK x y).
+- NEVER pass action commands to vision. NEVER expect vision to click or type.
+
+EXECUTOR RULES (WRITE-ONLY -- executor ONLY performs actions, never reads):
+- Executor performs atomic GUI commands. It does not inspect the screen.
+- Commands: CLICK x y, TYPE x y text, SCROLL x y up|down, WAIT seconds, PRESS key
+- Vision supplies coordinates -> executor performs the action -> vision verifies the result.
+- Flow: vision.locate -> executor.CLICK -> vision.page_state (verify)
+
+VISION->EXECUTOR WORKFLOW EXAMPLE:
+  Goal: Click the search box on YouTube
+  Step 1 -> {{"decision": "use_tool", "tool": "vision", "args": {{"action": "locate", "query": "search input"}}, "reason": "find search box coordinates"}}
+           -> Returns: {{"coordinates": [640, 52], "state": "FOUND"}}
+  Step 2 -> {{"decision": "use_tool", "tool": "executor", "args": {{"command": "CLICK 640 52"}}, "reason": "click at coordinates returned by vision"}}
+  Step 3 -> {{"decision": "use_tool", "tool": "vision", "args": {{"action": "page_state"}}, "reason": "verify click landed"}}
+
+WEBSITE AUTOMATION -- use browser_control (Playwright, DOM-based):
   For ANY website task (YouTube, Google, Gmail, etc.), ALWAYS use browser_control.
-  It accesses the actual page structure — never guesses coordinates.
+  It accesses the actual page structure -- never guesses coordinates.
 
   CRITICAL: browser_control "open" action ALWAYS needs a "url" argument.
   If the user says "open youtube", you must supply url: "https://youtube.com".
   If the user says "open kate" (desktop app), use window_manager instead.
 
-  Example — "open YouTube":
+  Example -- "open YouTube":
     {{"decision": "use_tool", "tool": "browser_control", "args": {{"action": "open", "url": "https://youtube.com"}}, "reason": "opening YouTube"}}
 
-  Example — "search YouTube for coconut oil" (step 1 of 5):
+  Example -- "search YouTube for coconut oil" (step 1 of 5):
     {{"decision": "use_tool", "tool": "browser_control", "args": {{"action": "open", "url": "https://youtube.com"}}, "reason": "navigate to YouTube first"}}
 
-  Example — "click the search box" (step 2):
+  Example -- "click the search box" (step 2):
     {{"decision": "use_tool", "tool": "browser_control", "args": {{"action": "click", "selector": "input[name='search_query']"}}, "reason": "click search box"}}
 
-  Example — "type coconut oil" (step 3):
+  Example -- "type coconut oil" (step 3):
     {{"decision": "use_tool", "tool": "browser_control", "args": {{"action": "type", "text": "coconut oil"}}, "reason": "type search query"}}
 
-  Example — "press enter" (step 4):
+  Example -- "press enter" (step 4):
     {{"decision": "use_tool", "tool": "browser_control", "args": {{"action": "press", "key": "Enter"}}, "reason": "submit search"}}
 
-  Example — "search the web for latest news":
+  Example -- "search the web for latest news":
     {{"decision": "use_tool", "tool": "browser_control", "args": {{"action": "open", "url": "https://duckduckgo.com"}}, "reason": "open search engine"}}
 
-DESKTOP APP — use window_manager (NOT browser_control):
-  For apps like kate, terminal, file manager → use window_manager.
-  Example — "open kate":
+DESKTOP APP -- use window_manager (NOT browser_control):
+  For apps like kate, terminal, file manager -> use window_manager.
+  Example -- "open kate":
     {{"decision": "use_tool", "tool": "window_manager", "args": {{"action": "open", "app": "kate"}}, "reason": "open kate text editor"}}
 
   Use get_elements to discover what's on a web page:
     {{"decision": "use_tool", "tool": "browser_control", "args": {{"action": "get_elements"}}, "reason": "list page elements"}}
 
-DESKTOP APP AUTOMATION — use computer_use (OCR + ydotool):
-  For apps like VS Code, file manager, settings — use computer_use.
-  Step 1 → computer_use open_url / focus_window
-  Step 2 → computer_use scan_screen   — builds element map with bounding boxes
-  Step 3 → computer_use click_map     — click element by text
-  Step 4 → computer_use type_text / press_key
+DESKTOP APP AUTOMATION -- use vision + executor:
+    For apps like VS Code, file manager, settings:
+    Step 1 -> window_manager launch/focus the app
+    Step 2 -> vision locate the required element or inspect page state
+    Step 3 -> executor run atomic GUI commands using returned coordinates
+    Step 4 -> vision verify the UI changed as expected
 
 DECISION RULE:
-  Website URL involved? → browser_control (Layer 1)
-  Desktop app?          → computer_use (Layer 3)
+    Computation?          -> code
+    Information lookup?   -> web
+    Website interaction?  -> browser_control first, vision second
+    Desktop GUI?          -> vision then executor
+    System/app control?   -> terminal_safe or window_manager
 
 Calibrating permanent positions (when user asks to "teach" or "save"):
-  save_position  site=X  element=Y  ← saves current mouse pos
-  click_element  site=X  element=Y  ← verify it works
+  save_position  site=X  element=Y  <- saves current mouse pos
+  click_element  site=X  element=Y  <- verify it works
 """
 
 
-_SUMMARIZE_THRESHOLD = 800   # Characters — outputs above this get LLM-summarized
+_SUMMARIZE_THRESHOLD = 800   # Characters -- outputs above this get LLM-summarized
 
 
 _JUNK_MARKERS = [
@@ -1402,9 +2215,9 @@ def _maybe_summarize(tool_name: str, result: str) -> str:
             model=config.DECISION_MODEL,
             messages=[
                 {'role': 'system', 'content':
-                    'Summarize the following tool output in ≤150 words. '
+                    'Summarize the following tool output in <=150 words. '
                     'Keep only information useful for the next planning step. '
-                    'Reply with plain text only — no JSON, no headers.'},
+                    'Reply with plain text only -- no JSON, no headers.'},
                 {'role': 'user', 'content': f"Tool: {tool_name}\n\n{result[:4000]}"}
             ],
             options={'temperature': 0.0, 'num_predict': 200}
@@ -1433,7 +2246,33 @@ def _parse_json(raw: str) -> dict:
         return {"decision": "respond", "reason": "planner parse error"}
 
 
-def _build_planner_system(tools_desc: str, active_tasks: list) -> str:
+def _sync_initial_todos(plan: list[str]) -> None:
+    if not plan:
+        return
+    todo_manager.clear_all()
+    created = todo_manager.create_items(plan)
+    if created:
+        todo_manager.update_status(created[0]['id'], 'in_progress')
+
+
+def _advance_todo_progress() -> None:
+    active = todo_manager.get_active()
+    in_progress = next((item for item in active if item.get('status') == 'in_progress'), None)
+    if in_progress:
+        todo_manager.update_status(in_progress['id'], 'done')
+
+    active = todo_manager.get_active()
+    next_pending = next((item for item in active if item.get('status') == 'pending'), None)
+    if next_pending:
+        todo_manager.update_status(next_pending['id'], 'in_progress')
+
+
+def _complete_all_todos() -> None:
+    for item in todo_manager.get_active():
+        todo_manager.update_status(item['id'], 'done')
+
+
+def _build_planner_system(tools_desc: str, active_tasks: list, analysis: dict) -> str:
     if active_tasks:
         ctx = task_manager.get_all_tasks_context(active_tasks)
         task_block = f"ACTIVE TASKS (continue working on these):\n{ctx}"
@@ -1441,9 +2280,11 @@ def _build_planner_system(tools_desc: str, active_tasks: list) -> str:
         task_block = ""
 
     shortcuts_block = system_shortcuts.get_shortcuts_prompt()
+    analysis_block = brain.format_analysis_for_prompt(analysis)
 
     return _PLANNER_SYSTEM.format(
         tools_desc=tools_desc,
+        analysis_block=analysis_block,
         task_block=task_block,
         shortcuts_block=shortcuts_block,
     )
@@ -1462,6 +2303,8 @@ def _is_tool_error(result: str) -> bool:
     )
 
 
+# == Main Turn Loop ============================================================
+
 def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -> str:
     """
     Full agent turn. Returns the final AI response string.
@@ -1471,8 +2314,19 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
 
     tools_desc = registry.describe_tools()
     active_tasks = task_manager.get_active_tasks()
+    analysis = brain.analyze_request(user_message)
 
-    # ── Fast path: Tier 1 (greeting) or Tier 2 (chat) ───────────────────────
+    if not active_tasks and analysis.get('needs_plan'):
+        task_manager.create_task(
+            title=analysis.get('task_title', analysis.get('title', 'Task')),
+            description=user_message,
+            category=analysis.get('category', 'task_request'),
+            plan=analysis.get('todo_plan', analysis.get('todo', [])),
+        )
+        _sync_initial_todos(analysis.get('todo_plan', analysis.get('todo', [])))
+        active_tasks = task_manager.get_active_tasks()
+
+    # == Fast path: Tier 1 (greeting) or Tier 2 (chat) ========================
     fast = classify_fast_path(user_message) if not active_tasks else 'agent'
 
     if fast in ('greeting', 'chat'):
@@ -1482,7 +2336,7 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
             # Tier 2: include memory context so the model can answer
             # "who am I", "what's my name", etc. without the planner.
             system += (
-                "\n\n[Background context — use this to inform your answers, "
+                "\n\n[Background context -- use this to inform your answers, "
                 "but do NOT repeat it back to the user]\n"
                 + memory_context
             )
@@ -1503,12 +2357,12 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
             print(f"[AgentLoop] Fast path ({fast}) error: {e}")
             return f"Sorry, something went wrong: {str(e)}"
 
-    planner_system = _build_planner_system(tools_desc, active_tasks)
+    planner_system = _build_planner_system(tools_desc, active_tasks, analysis)
 
-    working_request = user_message
+    working_request = f"{brain.format_analysis_for_prompt(analysis)}\n\nUser request:\n{user_message}"
 
     consecutive_errors   = 0
-    tool_calls_this_turn = 0  # Hard cap counter (BUG 4)
+    tool_calls_this_turn = 0  # Hard cap counter
     recent_results = []          # For loop detection
 
     for step in range(MAX_STEPS):
@@ -1533,20 +2387,25 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
 
         d_type = decision.get('decision')
 
-        # ── Start a new persistent task ──────────────────────────────────────
+        # == Start a new persistent task =======================================
         if d_type == 'start_task':
             task_id = task_manager.create_task(
                 title=decision.get('title', 'Task'),
                 description=decision.get('description', user_message),
-                credentials=decision.get('credentials', {})
+                credentials=decision.get('credentials', {}),
+                category=analysis.get('category', 'task_request'),
+                plan=analysis.get('todo_plan', analysis.get('todo', [])),
             )
             active_tasks = task_manager.get_active_tasks()
-            planner_system = _build_planner_system(tools_desc, active_tasks)
+            plan = analysis.get('todo_plan', analysis.get('todo', []))
+            if plan:
+                _sync_initial_todos(plan)
+            planner_system = _build_planner_system(tools_desc, active_tasks, analysis)
             ctx.add_step(decision, f"[Task {task_id} created]")
             working_request += "\n\nTask registered. Now execute it step by step using tools."
             continue
 
-        # ── Task complete (must specify task_id) ────────────────────────────
+        # == Task complete (must specify task_id) ==============================
         if d_type == 'task_done':
             tid = decision.get('task_id', '')
             # Fallback: complete first active task if id not specified
@@ -1555,35 +2414,75 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
             if tid:
                 summary = decision.get('summary', 'completed')
                 task_manager.complete_task(tid, summary)
+                _complete_all_todos()
                 ctx.add_step(decision, f"[Task {tid} completed: {summary}]")
                 active_tasks = task_manager.get_active_tasks()
-                planner_system = _build_planner_system(tools_desc, active_tasks)
+                planner_system = _build_planner_system(tools_desc, active_tasks, analysis)
             break
 
-        # ── Respond directly ─────────────────────────────────────────────────
+        # == Respond directly ==================================================
         if d_type != 'use_tool':
             break
 
         tool_name = decision.get('tool', '')
         tool_args = decision.get('args', {})
 
-        # ── Permission gate ──────────────────────────────────────────────────
+        # == Permission gate ===================================================
         if not registry.is_safe(tool_name):
             ctx.state = SystemState.WAITING_FOR_USER
-            ctx.add_step(decision, "[BLOCKED — awaiting confirmation]")
+            ctx.add_step(decision, "[BLOCKED -- awaiting confirmation]")
             ctx.state = SystemState.IDLE
             return (
                 f"I need to use '{tool_name}' for this. "
                 f"Reply 'yes' to allow or 'no' to cancel."
             )
 
-        # ── Execute tool (with retry on failure) ─────────────────────────────
-        # Hard cap: abort if too many tool calls this turn (prevents spam, BUG 4)
+        # == Validate executor commands before dispatch ========================
+        if tool_name == "executor":
+            cmd = tool_args.get("command", "")
+            cmds = tool_args.get("commands")
+            if cmd:
+                normalized = brain.normalize_action_command(str(cmd))
+                if normalized is None:
+                    ctx.add_step(decision, f"[Invalid action command: {cmd}]")
+                    working_request += (
+                        f"\n\n[Invalid command format: '{cmd}'. "
+                        "Use: CLICK x y, TYPE x y text, SCROLL x y direction, "
+                        "WAIT seconds, PRESS key]"
+                    )
+                    continue
+                tool_args["command"] = normalized
+            if cmds and isinstance(cmds, list):
+                normalized_cmds = []
+                all_valid = True
+                for c in cmds:
+                    n = brain.normalize_action_command(str(c))
+                    if n is None:
+                        ctx.add_step(decision, f"[Invalid action command: {c}]")
+                        working_request += (
+                            f"\n\n[Invalid command format: '{c}'. "
+                            "Use: CLICK x y, TYPE x y text, SCROLL x y direction, "
+                            "WAIT seconds, PRESS key]"
+                        )
+                        all_valid = False
+                        break
+                    normalized_cmds.append(n)
+                if not all_valid:
+                    continue
+                tool_args["commands"] = normalized_cmds
+
+        # == Execute tool (with retry on failure) ==============================
+        # Hard cap: abort if too many tool calls this turn (prevents spam)
         if tool_calls_this_turn >= MAX_TOOL_CALLS_PER_TURN:
             ctx.add_step({"decision": "capped"}, f"[Tool cap: {MAX_TOOL_CALLS_PER_TURN} calls reached]")
             break
 
         ctx.state = SystemState.EXECUTING_TOOL
+
+        # Capture pre-action screen state for verification
+        pre_hash = ""
+        if _needs_perception(tool_name, tool_args):
+            pre_hash = _capture_screen_hash()
 
         consecutive_errors = 0          # reset per-tool, not cumulative
         result = None
@@ -1605,6 +2504,34 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
 
         ctx.add_step(decision, result)
         tool_calls_this_turn += 1
+        _advance_todo_progress()
+
+        # == Post-action perception + verification =============================
+        perception_result = _perceive_after_action(tool_name, tool_args, ctx)
+        if perception_result:
+            ctx.add_step({"decision": "perceive", "tool": "vision"}, perception_result)
+            result = f"{result}\n\nPerception:\n{perception_result}"
+
+        # Verify the action had visible effect
+        changed, verify_msg = _verify_action_effect(pre_hash, tool_name, tool_args, ctx)
+        if verify_msg:
+            ctx.add_step({"decision": "verify"}, verify_msg)
+            result = f"{result}\n{verify_msg}"
+
+        # If action had no effect, inject a hint for the planner
+        if not changed and ctx.verification_failures <= config.MAX_VERIFICATION_FAILURES:
+            working_request += (
+                "\n\n[WARNING: Last action did not change the screen. "
+                "The element may not have been found, or the action failed. "
+                "Consider retrying with different coordinates or approach.]"
+            )
+        elif not changed and ctx.verification_failures > config.MAX_VERIFICATION_FAILURES:
+            ctx.add_step({"decision": "stuck"}, "[Repeated verification failures - breaking]")
+            return (
+                "I've tried this action multiple times but the screen isn't changing. "
+                "The target element may not be visible or interactable. "
+                "What should I try instead?"
+            )
 
         # Record in activity feed for UI debugging
         _TOOL_FEED.append({
@@ -1620,14 +2547,14 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
         if len(recent_results) > _LOOP_DETECT:
             recent_results.pop(0)
         if len(recent_results) == _LOOP_DETECT and len(set(recent_results)) == 1:
-            ctx.add_step({"decision": "stuck"}, "[Loop detected — breaking]")
+            ctx.add_step({"decision": "stuck"}, "[Loop detected -- breaking]")
             return (
-                "I seem to be stuck in a loop — the same tool keeps returning the same output.\n"
+                "I seem to be stuck in a loop -- the same tool keeps returning the same output.\n"
                 f"Last output: {result[:200]}\n"
                 "What should I do differently?"
             )
 
-        # Summarize large outputs before injecting into planning context (Improvement 4)
+        # Summarize large outputs before injecting into planning context
         preview = _maybe_summarize(tool_name, result)
         working_request += f"\n\nTool result ({tool_name}):\n{preview}"
 
@@ -1640,7 +2567,7 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
                 result
             )
 
-    # ── Final LLM response ───────────────────────────────────────────────────
+    # == Final LLM response ====================================================
     ctx.state = SystemState.IDLE
 
     # Inject memory context into the system prompt so the LLM treats it
@@ -1648,7 +2575,7 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
     system_prompt = persona_prompt
     if memory_context.strip():
         system_prompt += (
-            "\n\n[Background context — use this to inform your answers, "
+            "\n\n[Background context -- use this to inform your answers, "
             "but do NOT repeat it back to the user]\n"
             + memory_context
         )
@@ -1670,7 +2597,7 @@ def run_turn(user_message: str, persona_prompt: str, memory_context: str = "") -
         )
         return _sanitize_response(response['message']['content'])
     except Exception as e:
-        print(f"[AgentLoop] {selected_model} failed: {e} — falling back to {config.CHAT_MODEL}")
+        print(f"[AgentLoop] {selected_model} failed: {e} -- falling back to {config.CHAT_MODEL}")
         if selected_model != config.CHAT_MODEL:
             try:
                 response = client.chat(
@@ -1693,6 +2620,7 @@ class SystemState(Enum):
     IDLE = auto()
     PLANNING = auto()
     EXECUTING_TOOL = auto()
+    PERCEIVING = auto()
     WAITING_FOR_USER = auto()
     WAITING_FOR_SUDO = auto()
     ERROR = auto()
@@ -1711,6 +2639,8 @@ class TurnContext:
         self.last_result = None
         self.retry_count = 0
         self.state = SystemState.IDLE
+        self.pre_action_screen_hash = None
+        self.verification_failures = 0
 
     def add_step(self, decision, result):
         """Logs a step into history for context awareness."""
@@ -2346,7 +3276,13 @@ def _now() -> str:
 
 # ─── Public API ────────────────────────────────────────────────────────────────
 
-def create_task(title: str, description: str, credentials: dict = None) -> str:
+def create_task(
+    title: str,
+    description: str,
+    credentials: dict = None,
+    category: str = "task_request",
+    plan: list | None = None,
+) -> str:
     """Create a new in-progress task. Returns the task id."""
     with _task_lock:
         data = _load()
@@ -2355,6 +3291,8 @@ def create_task(title: str, description: str, credentials: dict = None) -> str:
             "title":        title,
             "description":  description,
             "credentials":  credentials or {},
+            "category":     category,
+            "plan":         plan or [],
             "steps":        [],
             "status":       "in_progress",
             "created_at":   _now(),
@@ -2480,8 +3418,10 @@ def get_task_context(task: dict) -> str:
 
     return (
         f"Task [{task['id']}]: {task['title']}\n"
+        f"Category: {task.get('category', 'task_request')}\n"
         f"Goal: {task['description']}"
         f"{creds_text}\n"
+        f"Plan: {json.dumps(task.get('plan', []))}\n"
         f"Steps done:\n{steps_text}\n"
         f"Last updated: {task.get('last_updated', '?')}"
     )
@@ -2630,6 +3570,7 @@ FILE: ai-model/engines/janitor.py  [maintenance + summarizer trigger]
 --------------------------------------------------------------------------------
 # ========================= engines/janitor.py =========================
 import os
+import time
 import config
 from engines import summarizer
 
@@ -2642,6 +3583,9 @@ def run_maintenance():
     # 2. Check for oversized raw logs (Safety)
     # (This prevents a single day from exploding the context)
     check_raw_log_limits()
+
+    # 3. Clear stale screenshots to keep perception storage bounded
+    cleanup_old_screenshots()
 
     print("Maintenance Complete.")
 
@@ -2657,6 +3601,35 @@ def check_raw_log_limits():
         # Approx 4 chars per token. 8000 tokens ~ 32KB text.
         if size > 100000: # 100KB warning threshold
             print(f"Warning: Today's log is large ({size} bytes). Consider starting a new session.")
+
+
+def cleanup_old_screenshots():
+    keep = {
+        "screenshot.png",
+        "ocr.txt",
+        "screen_map.json",
+        "_ui_parse.png",
+        "_browser.png",
+        "_cu_screen.png",
+        "_cu_verify.png",
+    }
+    cutoff = time.time() - config.SCREENSHOT_RETENTION_SECONDS
+    if not os.path.isdir(config.SCREENSHOT_DIR):
+        return
+
+    for name in os.listdir(config.SCREENSHOT_DIR):
+        path = os.path.join(config.SCREENSHOT_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        if name in keep:
+            continue
+        if not name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            continue
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            continue
 
 --------------------------------------------------------------------------------
 FILE: ai-model/engines/summarizer.py  [LLM-based log summarization]
@@ -3078,10 +4051,15 @@ TOOL_CATEGORIES = {
         "desc":  "Search the web, fetch pages, browse websites",
         "tools": ["web", "browser_control"],
     },
+    "perception_tools": {
+        "label": "Perception & Vision",
+        "desc":  "Read page state, locate UI elements, monitor OCR completion",
+        "tools": ["vision", "ui_parser", "screenshot"],
+    },
     "computer_tools": {
         "label": "Desktop & Computer Control",
         "desc":  "Screen automation, mouse/keyboard, window management, screenshots, UI detection",
-        "tools": ["computer_use", "actions", "window_manager", "screenshot", "ui_parser"],
+        "tools": ["computer_use", "executor", "actions", "window_manager"],
     },
     "filesystem_tools": {
         "label": "Files & Code",
@@ -3118,6 +4096,8 @@ def _load():
     from tools import computer_use    # screen OCR + mouse/keyboard automation
     from tools import browser_control  # Playwright DOM-based web automation (Layer 1)
     from tools import ui_parser       # YOLO UI detection + targeted OCR
+    from tools import vision          # structured perception interface
+    from tools import executor        # atomic GUI action executor
     _REGISTRY = {
         'system_diagnostics': system_diagnostics,
         'file_search':        files,
@@ -3133,6 +4113,8 @@ def _load():
         'browser_control':    browser_control,
         'code':               code,
         'ui_parser':          ui_parser,
+        'vision':             vision,
+        'executor':           executor,
     }
 
     # Optional: load actions tool if ydotool is available
@@ -5035,6 +6017,11 @@ import config
 _SCREENSHOT_PATH = os.path.join(config.SCREENSHOT_DIR, "_ui_parse.png")
 _MAP_CACHE = os.path.join(config.SCREENSHOT_DIR, "screen_map.json")
 
+# Screen resolution — coordinates are in these native pixels.
+# Updated automatically on first capture; set defaults for 1920x1200.
+SCREEN_W = 1920
+SCREEN_H = 1200
+
 # Model path: check config, fallback to default location
 _DEFAULT_MODEL_PATH = os.path.join(config.BASE_DIR, "models", "ui_detect.pt")
 UI_MODEL_PATH = getattr(config, 'UI_MODEL_PATH', _DEFAULT_MODEL_PATH)
@@ -5131,11 +6118,19 @@ def _get_class_map() -> dict:
 # ── Screenshot capture ────────────────────────────────────────────────────────
 
 def _capture(path: str = None) -> bool:
-    """Capture fullscreen via grim. Returns True on success."""
+    """Capture fullscreen via grim. Updates SCREEN_W/H from the image."""
+    global SCREEN_W, SCREEN_H
     if path is None:
         path = _SCREENSHOT_PATH
     try:
         subprocess.run(["grim", path], check=True, capture_output=True, timeout=8)
+        # Read actual resolution from the captured image
+        try:
+            from PIL import Image
+            with Image.open(path) as img:
+                SCREEN_W, SCREEN_H = img.size
+        except Exception:
+            pass  # keep defaults
         return True
     except Exception:
         return False
@@ -5308,6 +6303,8 @@ def parse_screen(
             "h": det["h"],
             "cx": cx,
             "cy": cy,
+            "click_x": cx,    # exact pixel to click (screen coords)
+            "click_y": cy,    # exact pixel to click (screen coords)
             "conf": det["confidence"],
         })
 
@@ -5318,6 +6315,8 @@ def parse_screen(
     cache = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source": "yolo",
+        "screen_w": SCREEN_W,
+        "screen_h": SCREEN_H,
         "count": len(elements),
         "elements": elements,
     }
@@ -6024,7 +7023,7 @@ def run_tool(args=None):
         elif action == "focus_window":
             return _focus_window(args.get("app", ""))
 
-        elif action == "launch_app":
+        elif action in ("launch_app", "open"):
             return _launch_app(args.get("app", ""))
 
         elif action == "close_window":
@@ -6036,7 +7035,7 @@ def run_tool(args=None):
         else:
             return (
                 f"Unknown action: '{action}'. "
-                "Available: list_windows, focus_window, launch_app, close_window, get_active"
+                "Available: list_windows, focus_window, launch_app, open, close_window, get_active"
             )
 
     except Exception as e:

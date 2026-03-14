@@ -5,6 +5,7 @@ class SystemState(Enum):
     IDLE = auto()
     PLANNING = auto()
     EXECUTING_TOOL = auto()
+    PERCEIVING = auto()
     WAITING_FOR_USER = auto()
     WAITING_FOR_SUDO = auto()
     ERROR = auto()
@@ -23,6 +24,8 @@ class TurnContext:
         self.last_result = None
         self.retry_count = 0
         self.state = SystemState.IDLE
+        self.pre_action_screen_hash = None
+        self.verification_failures = 0
 
     def add_step(self, decision, result):
         """Logs a step into history for context awareness."""
