@@ -1,0 +1,32 @@
+{
+  "_schema": "prep_status v1",
+  "_description": "Per-subject exam preparation completion. Updated during daily checkins.",
+  "engineering_mathematics_ii": {
+    "completion_pct": 0,
+    "topics_done": [],
+    "topics_pending": ["Integration", "Differential Equations", "Laplace Transform", "Z-Transform"],
+    "last_updated": null,
+    "notes": ""
+  },
+  "digital_system_design": {
+    "completion_pct": 0,
+    "topics_done": [],
+    "topics_pending": ["Boolean Algebra", "Flip-Flops", "Sequential Circuits", "FSM", "Counters"],
+    "last_updated": null,
+    "notes": ""
+  },
+  "electronic_principles_and_devices": {
+    "completion_pct": 0,
+    "topics_done": [],
+    "topics_pending": ["Diodes", "BJT", "FET", "Op-Amp", "Oscillators"],
+    "last_updated": null,
+    "notes": ""
+  },
+  "engineering_physics": {
+    "completion_pct": 0,
+    "topics_done": [],
+    "topics_pending": ["Wave Mechanics", "Quantum Mechanics", "Lasers", "Fiber Optics", "Superconductivity"],
+    "last_updated": null,
+    "notes": ""
+  }
+}

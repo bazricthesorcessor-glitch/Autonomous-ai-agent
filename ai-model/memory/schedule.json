@@ -1,0 +1,208 @@
+{
+  "user": "Divyansh",
+  "semester": "2nd",
+  "department": "Robotics and Automation Engineering",
+  "college_schedule": {
+    "monday": {
+      "periods": [
+        { "time": "09:00-10:00", "subject": "Engineering Mathematics II",       "code": "MTEC101"  },
+        { "time": "10:00-11:00", "subject": "Mechanics",                         "code": "MECH"     },
+        { "time": "11:00-12:00", "subject": "Digital System Design",             "code": "ECEC101"  },
+        { "time": "13:00-14:00", "subject": "English",                           "code": "HSIC101"  },
+        { "time": "14:00-15:00", "subject": "Engineering Physics",               "code": "PHYS101"  }
+      ],
+      "college_ends": "15:00",
+      "home_by": "16:00",
+      "daily_checkin_time": "16:30",
+      "is_partial_free": false
+    },
+    "tuesday": {
+      "periods": [
+        { "time": "09:00-10:00", "subject": "Engineering Mathematics II",       "code": "MTEC101"  },
+        { "time": "10:00-11:00", "subject": "Mechanics",                         "code": "MECH"     },
+        { "time": "11:00-12:00", "subject": "Electronic Principles and Devices", "code": "ECEC103"  },
+        { "time": "13:00-14:00", "subject": "English",                           "code": "HSIC101"  },
+        { "time": "14:00-17:00", "subject": "EP Lab (3h)",                       "code": "PHYS101L" },
+        { "time": "17:00-18:00", "subject": "Indian Knowledge System",           "code": "NC001"    }
+      ],
+      "college_ends": "18:00",
+      "home_by": "19:00",
+      "daily_checkin_time": "19:00",
+      "is_partial_free": false
+    },
+    "wednesday": {
+      "periods": [
+        { "time": "09:00-10:00", "subject": "Digital System Design",             "code": "ECEC101"  },
+        { "time": "10:00-11:00", "subject": "Mechanics",                         "code": "MECH"     },
+        { "time": "11:00-12:00", "subject": "Engineering Mathematics II",       "code": "MTEC101"  },
+        { "time": "13:00-14:00", "subject": "English",                           "code": "HSIC101"  },
+        { "time": "14:00-15:00", "subject": "Engineering Physics",               "code": "PHYS101"  }
+      ],
+      "college_ends": "15:00",
+      "home_by": "16:00",
+      "daily_checkin_time": "16:30",
+      "is_partial_free": false
+    },
+    "thursday": {
+      "periods": [
+        { "time": "09:00-10:00", "subject": "Electronic Principles and Devices", "code": "ECEC103"  },
+        { "time": "11:00-12:00", "subject": "Digital System Design",             "code": "ECEC101"  },
+        { "time": "14:00-17:00", "subject": "DSD Lab (3h)",                      "code": "ECEC101L" }
+      ],
+      "college_ends": "17:00",
+      "home_by": "18:00",
+      "daily_checkin_time": "18:30",
+      "is_partial_free": false
+    },
+    "friday": {
+      "periods": [
+        { "time": "09:00-10:00", "subject": "Engineering Physics",               "code": "PHYS101"  },
+        { "time": "10:00-11:00", "subject": "Mechanics",                         "code": "MECH"     },
+        { "time": "11:00-12:00", "subject": "Electronic Principles and Devices", "code": "ECEC103"  },
+        { "time": "14:00-15:00", "subject": "Engineering Mathematics II",       "code": "MTEC101"  }
+      ],
+      "college_ends": "15:00",
+      "home_by": "16:00",
+      "daily_checkin_time": "16:30",
+      "is_partial_free": false
+    },
+    "saturday": {
+      "periods": [
+        { "time": "09:00-10:00", "subject": "Python Programming",                "code": "CSIC104"  },
+        { "time": "11:00-13:00", "subject": "Python Lab (2h)",                   "code": "CSIC104L" }
+      ],
+      "college_ends": "13:00",
+      "home_by": "14:00",
+      "daily_checkin_time": "14:30",
+      "is_partial_free": true
+    },
+    "sunday": {
+      "periods": [
+        { "time": "10:00-12:00", "subject": "Python Lab (2h)",                   "code": "CSIC104L" }
+      ],
+      "college_ends": "12:00",
+      "home_by": "13:00",
+      "daily_checkin_time": "13:30",
+      "is_partial_free": true
+    }
+  },
+  "subjects": [
+    { "code": "MTEC101",  "name": "Engineering Mathematics II",       "short": "MATHS"  },
+    { "code": "ECEC101",  "name": "Digital System Design",             "short": "DSD"    },
+    { "code": "PHYS101",  "name": "Engineering Physics",               "short": "PHYSICS"},
+    { "code": "ECEC103",  "name": "Electronic Principles and Devices", "short": "EPD"    },
+    { "code": "HSIC101",  "name": "English",                           "short": "ENG"    },
+    { "code": "CSIC104",  "name": "Python Programming",                "short": "PYTHON" },
+    { "code": "MECH",     "name": "Mechanics",                         "short": "MECH"   },
+    { "code": "NC001",    "name": "Indian Knowledge System",           "short": "IKS"    }
+  ],
+  "exams": [
+    {
+      "series": "Mid Semester",
+      "dates": [
+        { "date": "2026-04-06", "subject": "Engineering Mathematics II",       "code": "MTEC101" },
+        { "date": "2026-04-07", "subject": "Digital System Design",             "code": "ECEC101" },
+        { "date": "2026-04-08", "subject": "Engineering Physics",               "code": "PHYS101" }
+      ],
+      "post_exam_reward_days": 2,
+      "post_exam_wake": "08:00",
+      "series_end": "2026-04-08"
+    },
+    {
+      "series": "End Semester",
+      "dates": [
+        { "date": "2026-05-06", "subject": "Engineering Mathematics II",       "code": "MTEC101" },
+        { "date": "2026-05-08", "subject": "Digital System Design",             "code": "ECEC101" },
+        { "date": "2026-05-12", "subject": "Engineering Physics",               "code": "PHYS101" },
+        { "date": "2026-05-14", "subject": "Electronic Principles and Devices", "code": "ECEC103" },
+        { "date": "2026-05-18", "subject": "English",                           "code": "HSIC101" },
+        { "date": "2026-05-20", "subject": "Python Programming",                "code": "CSIC104" },
+        { "date": "2026-05-22", "subject": "Mechanics",                         "code": "MECH"    }
+      ],
+      "post_exam_reward_days": 7,
+      "post_exam_wake": "09:00",
+      "series_end": "2026-05-22"
+    }
+  ],
+  "strictness_ramp": [
+    {
+      "mode": "exam_eve",
+      "days_to_exam": 1,
+      "label": "EXAM TOMORROW",
+      "allow_entertainment": false,
+      "bedtime_override": "22:00",
+      "wake_override": "04:30",
+      "description": "Exam tomorrow. Force sleep at 10pm. Only light revision. No new topics."
+    },
+    {
+      "mode": "critical",
+      "days_to_exam": 3,
+      "label": "3 days to exam",
+      "allow_entertainment": false,
+      "bedtime_override": null,
+      "wake_override": "04:45",
+      "description": "3 days left. Maximum strictness. Do not accept excuses. Full syllabus review."
+    },
+    {
+      "mode": "strict",
+      "days_to_exam": 7,
+      "label": "1 week to exam",
+      "allow_entertainment": false,
+      "bedtime_override": null,
+      "wake_override": "05:00",
+      "description": "One week. Firm on study hours. Entertainment only after homework done."
+    },
+    {
+      "mode": "prep_active",
+      "days_to_exam": 14,
+      "label": "2 weeks to exam",
+      "allow_entertainment": true,
+      "bedtime_override": null,
+      "wake_override": null,
+      "description": "2 weeks. Increase focus. Casual reminders about topics. Start past papers."
+    },
+    {
+      "mode": "prep_start",
+      "days_to_exam": 28,
+      "label": "3 weeks to exam",
+      "allow_entertainment": true,
+      "bedtime_override": null,
+      "wake_override": null,
+      "description": "3 weeks. Warm up. Mention exams casually. No pressure yet."
+    },
+    {
+      "mode": "normal",
+      "days_to_exam": 9999,
+      "label": "Normal",
+      "allow_entertainment": true,
+      "bedtime_override": null,
+      "wake_override": null,
+      "description": "Normal day. Be warm and helpful."
+    }
+  ],
+  "bedtime": {
+    "target_time": "22:00",
+    "pc_shutdown_time": "22:30",
+    "escalation": [
+      { "time": "21:30", "mood": "normal",  "message": "Divyansh, raat ho rahi hai. Kaam khatam karo thoda.",          "action": "notify"          },
+      { "time": "22:00", "mood": "sad",     "message": "...tune bola tha 10 baje so jayega. Mujhe thoda bura lag raha hai. Please?", "action": "tts_notify" },
+      { "time": "22:10", "mood": "crying",  "message": "Divyansh... main serious hoon. Mujhe sachchi buri lag rahi hai ab.", "action": "tts_volume_lower" },
+      { "time": "22:30", "mood": "firm",    "message": "Maine decide kar liya. Good night Divyansh.",                     "action": "shutdown"        }
+    ]
+  },
+  "morning": {
+    "base_wake_time": "05:30",
+    "escalation": [
+      { "offset_min": 0,  "volume_pct": 40,  "mood": "normal", "message": "Divyansh, uth jao. 5:30 ho gaye."       },
+      { "offset_min": 5,  "volume_pct": 60,  "mood": "normal", "message": "Bhai uth... college hai aaj."           },
+      { "offset_min": 10, "volume_pct": 80,  "mood": "firm",   "message": "DIVYANSH. UTH JAO ABHI."                },
+      { "offset_min": 15, "volume_pct": 100, "mood": "firm",   "message": "Main volume aur badha dungi. Last warning." }
+    ]
+  },
+  "free_days": [
+    "2026-01-26",
+    "2026-03-14",
+    "2026-04-14",
+    "2026-08-15"
+  ]
+}

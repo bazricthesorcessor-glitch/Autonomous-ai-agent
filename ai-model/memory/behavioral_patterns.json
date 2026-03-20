@@ -1,0 +1,54 @@
+{
+  "_schema": "behavioral_patterns v1",
+  "_description": "Avril observes and stores behavioral patterns to calibrate trust and predictions.",
+  "patterns": [
+    {
+      "id": "five_more_minutes",
+      "description": "When Divyansh says 'bas 5 minute' or 'just 5 minutes', he usually means 30-45 min",
+      "trigger_phrase": [
+        "bas 5 minute",
+        "5 more minutes",
+        "just 5 min",
+        "thodi der"
+      ],
+      "observed_count": 0,
+      "avg_actual_minutes": null,
+      "last_observed": null,
+      "trust_weight": 0.3
+    },
+    {
+      "id": "homework_denial",
+      "description": "When Divyansh says 'I already did it' about homework, there's a chance he hasn't",
+      "trigger_phrase": [
+        "kar liya",
+        "already did",
+        "ho gaya",
+        "done ho gaya"
+      ],
+      "observed_count": 0,
+      "true_count": 0,
+      "false_count": 0,
+      "accuracy_pct": null,
+      "last_observed": null,
+      "contexts": [],
+      "trust_weight": 0.7
+    },
+    {
+      "id": "dsd_avoidance",
+      "description": "Divyansh tends to avoid DSD when stressed",
+      "subject": "DSD",
+      "avoidance_events": [],
+      "observed_count": 0,
+      "last_observed": null
+    },
+    {
+      "id": "late_night_thursday",
+      "description": "Tends to stay up late on Thursdays after EP Lab",
+      "day": "Thursday",
+      "observed_count": 0,
+      "last_observed": null
+    }
+  ],
+  "claim_history": [],
+  "last_scan_date": "2026-03-16"
+}

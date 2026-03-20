@@ -143,9 +143,16 @@ def _group_into_elements(words: list[dict]) -> list[dict]:
         elements.append(current)
 
     # Add center coordinates and clean up
+    # HiDPI fix: grim captures at physical pixels, ydotool uses logical
+    scale = config.get_monitor_scale()
     for el in elements:
-        el["cx"] = el["x"] + el["w"] // 2
-        el["cy"] = el["y"] + el["h"] // 2
+        cx = el["x"] + el["w"] // 2
+        cy = el["y"] + el["h"] // 2
+        if scale > 1.0:
+            cx = int(cx / scale)
+            cy = int(cy / scale)
+        el["cx"] = cx
+        el["cy"] = cy
         del el["_words"]
 
     return elements

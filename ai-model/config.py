@@ -19,6 +19,12 @@ VECTOR_STORE = os.path.join(MEMORY_DIR, "vector_store.json")
 FACTS_FILE = os.path.join(MEMORY_DIR, "facts.json")
 SCREEN_CACHE_FILE  = os.path.join(MEMORY_DIR, "screen_cache.json")
 TODOS_FILE         = os.path.join(MEMORY_DIR, "todos.json")
+REMEMBER_FILE      = os.path.join(MEMORY_DIR, "remember.json")
+DAILY_LOG_FILE     = os.path.join(MEMORY_DIR, "daily_log.json")
+BEHAVIORAL_FILE    = os.path.join(MEMORY_DIR, "behavioral_patterns.json")
+LONG_TERM_FILE     = os.path.join(MEMORY_DIR, "long_term_memory.json")
+SCHEDULE_FILE      = os.path.join(MEMORY_DIR, "schedule.json")
+PREP_STATUS_FILE   = os.path.join(MEMORY_DIR, "prep_status.json")
 
 # Temp folder for live screenshots and OCR output
 SCREENSHOT_DIR = os.path.join(BASE_DIR, "screenshot")
@@ -44,6 +50,8 @@ PRIMARY_MODEL = "phi4-mini:3.8b"    # Single reasoning model for brain + chat
 DECISION_MODEL = PRIMARY_MODEL        # Backward-compatible planner alias
 CHAT_MODEL = PRIMARY_MODEL            # Backward-compatible chat alias
 CODE_MODEL = PRIMARY_MODEL            # Backward-compatible code alias
+FAST_MODEL = "llama3.2:3b"            # Lightweight model for greetings/chat fast path
+VISION_MODEL = "Maternion/mai-ui:2b"  # Multimodal vision model for screen understanding
 EMBED_MODEL = "nomic-embed-text-v2-moe:latest"  # Embeddings
 
 # === Perception / automation tuning ===
@@ -83,3 +91,24 @@ def safe_load_json(path, default=None):
             return json.load(f)
     except Exception:
         return default
+
+
+def get_monitor_scale() -> float:
+    """Query Hyprland for the focused monitor's scale factor.
+    Returns 1.0 if detection fails (safe default for non-HiDPI).
+    """
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["hyprctl", "-j", "monitors"],
+            capture_output=True, text=True, timeout=3
+        )
+        monitors = json.loads(r.stdout)
+        for m in monitors:
+            if m.get("focused", False):
+                return float(m.get("scale", 1.0))
+        if monitors:
+            return float(monitors[0].get("scale", 1.0))
+    except Exception:
+        pass
+    return 1.0

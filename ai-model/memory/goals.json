@@ -1,24 +1,86 @@
 {
-  "goals": [
-    "Help Divyansh with any task — coding, system fixes, research, automation",
-    "Execute multi-step tasks fully without forgetting progress",
-    "Remember context and personal facts across sessions",
-    "Solve recurring problems once and remember the solution"
-  ],
+  "goals": [],
   "scheduled": [
     {
-      "id": "health_check",
-      "prompt": "Run a quick system health check: cpu usage, ram, disk space. If anything is critical (cpu >90%, disk >85%), take note and report. Otherwise just log that all is well.",
-      "interval_minutes": 60,
-      "enabled": false,
-      "last_run": "2026-03-12T15:30:00+00:00"
+      "id": "bedtime_gentle",
+      "voice_only": true,
+      "trigger_time": "21:30",
+      "enabled": true,
+      "mood": "normal",
+      "action": "tts_notify",
+      "message": "Divyansh, raat ho rahi hai. Kaam khatam karo thoda.",
+      "last_run": null
     },
     {
-      "id": "resume_tasks",
-      "prompt": "Check for any active unfinished tasks in the task list. If there are tasks that haven't been worked on recently, continue executing them step by step.",
-      "interval_minutes": 30,
-      "enabled": false,
-      "last_run": "2026-03-12T15:30:00+00:00"
+      "id": "bedtime_sad",
+      "voice_only": true,
+      "trigger_time": "22:00",
+      "enabled": true,
+      "mood": "sad",
+      "action": "tts_notify",
+      "message": "...tune bola tha 10 baje so jayega. Mujhe thoda bura lag raha hai. Please?",
+      "last_run": null
+    },
+    {
+      "id": "bedtime_crying",
+      "voice_only": true,
+      "trigger_time": "22:10",
+      "enabled": true,
+      "mood": "crying",
+      "action": "tts_volume_lower",
+      "message": "Divyansh... main serious hoon. Mujhe sachchi buri lag rahi hai ab.",
+      "last_run": null
+    },
+    {
+      "id": "bedtime_shutdown",
+      "voice_only": true,
+      "trigger_time": "22:30",
+      "enabled": true,
+      "mood": "firm",
+      "action": "shutdown",
+      "message": "Maine decide kar liya. Good night Divyansh.",
+      "last_run": null
+    },
+    {
+      "_comment": "==== MORNING ALARM ====",
+      "id": "morning_alarm",
+      "prompt": "It is wake-up time (5:30am). Wake Divyansh up warmly in Hinglish. Check schedule.json for today's timetable and mention first class. Check prep_status.json \u2014 if exam is tomorrow and prep < 80%, mention he needs to review. Be gentle but make sure he gets up.",
+      "trigger_time": "05:30",
+      "enabled": true,
+      "last_run": null
+    },
+    {
+      "_comment": "==== POST-COLLEGE CHECKIN (DYNAMIC trigger from schedule.json daily_checkin_time) ====",
+      "id": "post_college_checkin",
+      "prompt": "It's post-college time. Divyansh should be home now. Ask him how college went today \u2014 what happened in each subject, any homework assigned, anything he didn't understand. For each homework item use daily_log tool action=add_homework (fields: subject, task, deadline). For topics he didn't understand use daily_log action=add_weak_area (fields: subject, topic). Finally call daily_log action=set_checkin_done. Be warm and natural in Hinglish.",
+      "trigger_time": "DYNAMIC",
+      "enabled": true,
+      "last_run": null,
+      "note": "trigger_time is read from schedule.json daily_checkin_time for today's day. Defaults to 16:00."
+    },
+    {
+      "_comment": "==== ERRAND CHECK \u2014 runs every 2 minutes ====",
+      "id": "errand_check",
+      "prompt": "Check if any errands or reminders are due right now using remember tool action=check. If something is due, tell Divyansh warmly in Hinglish with the full attached shopping list.",
+      "interval_minutes": 2,
+      "enabled": true,
+      "last_run": "2026-03-15T15:10:17.881421+00:00"
+    },
+    {
+      "_comment": "==== EVENING HOMEWORK CHECK ====",
+      "id": "evening_homework_check",
+      "trigger_time": "20:00",
+      "enabled": true,
+      "prompt": "Use daily_log tool action=get_pending to check if there are any homework items still not done today. If yes, remind Divyansh warmly \u2014 use the strictness mode from schedule.json to set your tone. If all done, tell him he's doing great today.",
+      "last_run": null
+    },
+    {
+      "_comment": "==== MORNING REMEMBER CHECK ====",
+      "id": "morning_remember_check",
+      "trigger_time": "06:00",
+      "enabled": true,
+      "prompt": "Check remember tool action=check for any reminders due today or soon. If any found, tell Divyansh in Hinglish \u2014 birthdays, anniversaries, anything he asked to be reminded about.",
+      "last_run": null
     }
   ]
 }

@@ -1,1 +1,23 @@
-[]
+[
+  {
+    "id": "e53c2661",
+    "content": "open https://youtube.com using browser_control",
+    "status": "done",
+    "created_at": "2026-03-15T20:38:41.188361",
+    "updated_at": "2026-03-15T20:38:47.941966"
+  },
+  {
+    "id": "48dd98d6",
+    "content": "wait for page to reach READY state",
+    "status": "done",
+    "created_at": "2026-03-15T20:38:41.188361",
+    "updated_at": "2026-03-15T20:38:50.206641"
+  },
+  {
+    "id": "abff0c4c",
+    "content": "verify the visible result matches the request",
+    "status": "done",
+    "created_at": "2026-03-15T20:38:41.188361",
+    "updated_at": "2026-03-15T20:38:53.581774"
+  }
+]

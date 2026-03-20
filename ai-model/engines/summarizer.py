@@ -55,20 +55,21 @@ def run_summarization():
             raw_path = os.path.join(config.DAILY_DIR, folder, "raw.log")
             summary_path = os.path.join(config.DAILY_DIR, folder, "summary.txt")
 
-            # FIX: Only summarize if older than RAW_DAYS_WINDOW (10 days)
+            # Generate summaries for days 3+ (was > 10, caused 8-day blackout)
             if os.path.exists(raw_path) and not os.path.exists(summary_path):
-                if age_days > config.RAW_DAYS_WINDOW:
+                if age_days >= 3:
                     print(f"Summarizing {folder} (Day {age_days})...")
                     summary_text = generate_summary(raw_path)
                     with open(summary_path, "w") as f:
                         f.write(summary_text)
                     print(f"Created summary for {folder}")
-                    # Remove raw log to reclaim disk once summary exists
-                    try:
-                        os.remove(raw_path)
-                        print(f"Cleaned up raw log for {folder}")
-                    except OSError as rm_err:
-                        print(f"[Summarizer] Could not remove {raw_path}: {rm_err}")
+                    # Only delete raw log once past the retention window
+                    if age_days > config.RAW_DAYS_WINDOW:
+                        try:
+                            os.remove(raw_path)
+                            print(f"Cleaned up raw log for {folder}")
+                        except OSError as rm_err:
+                            print(f"[Summarizer] Could not remove {raw_path}: {rm_err}")
         except ValueError:
             continue
 

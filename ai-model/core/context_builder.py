@@ -5,12 +5,13 @@ from datetime import datetime
 import config
 from engines import memory_engine
 from engines import fact_engine
+from core.context_enricher import build_user_context, format_for_prompt
 
 # Cap per day of raw log — avoids context explosion from old verbose days
 _MAX_RAW_CHARS_PER_DAY = getattr(config, 'MAX_RAW_TOKENS_PER_DAY', 8000)
 
 # Hard cap on total context length to prevent bloated LLM prompts
-_MAX_CONTEXT_CHARS = 4000
+_MAX_CONTEXT_CHARS = 12000
 
 # Track the last screen hash that was injected — prevents OCR flood.
 _last_injected_screen_hash: str | None = None
@@ -39,36 +40,43 @@ def get_daily_folders_sorted():
 
 
 def collect_raw_logs(folders):
-    """Collect only today + yesterday raw logs — older days use summaries."""
+    """Today (5000 chars) + yesterday (3000) + day before (2000). Recency-weighted."""
     raw_blocks = []
-    for folder in folders[:2]:  # Only last 2 days
+    budgets = [5000, 3000, 2000]
+    for i, folder in enumerate(folders[:3]):
+        budget   = budgets[i] if i < len(budgets) else 1500
         raw_path = os.path.join(config.DAILY_DIR, folder, "raw.log")
-        content = read_file(raw_path)
-        if content:
-            # Only keep actual conversations, strip scheduled goal noise
-            lines = []
-            for line in content.split('\n'):
-                # Skip lines that are just scheduled goal error spam
-                if '[SCHEDULED GOAL' in line or 'No module named' in line:
-                    continue
-                lines.append(line)
-            content = '\n'.join(lines).strip()
-            if not content:
-                continue
-            if len(content) > _MAX_RAW_CHARS_PER_DAY:
-                content = "...[truncated]...\n" + content[-_MAX_RAW_CHARS_PER_DAY:]
-            raw_blocks.append(f"[{folder}]\n{content}")
+        content  = read_file(raw_path)
+        if not content:
+            continue
+        lines = [
+            l for l in content.split('\n')
+            if '[SCHEDULED GOAL' not in l and 'No module named' not in l
+        ]
+        content = '\n'.join(lines).strip()
+        if not content:
+            continue
+        if len(content) > budget:
+            content = "...[truncated]...\n" + content[-budget:]
+        raw_blocks.append(f"[{folder}]\n{content}")
     return "\n".join(raw_blocks)
 
 
 def collect_summaries(folders):
     summary_blocks = []
-    # Start after the 2 raw-log days
-    for folder in folders[2:7]:  # Days 3-7
+    # Start after the 2 raw-log days, cover days 3-10
+    for folder in folders[2:10]:
         summary_path = os.path.join(config.DAILY_DIR, folder, "summary.txt")
         content = read_file(summary_path)
         if content:
             summary_blocks.append(f"[{folder}] {content[:500]}")
+            continue
+        # Fallback: if no summary yet, read tail of raw.log
+        raw_path = os.path.join(config.DAILY_DIR, folder, "raw.log")
+        raw_content = read_file(raw_path)
+        if raw_content:
+            tail = raw_content[-1500:] if len(raw_content) > 1500 else raw_content
+            summary_blocks.append(f"[{folder}] (raw) {tail}")
     return "\n".join(summary_blocks)
 
 
@@ -143,6 +151,18 @@ def collect_vector_memory(user_input):
     return "Relevant memories:\n" + "\n".join(f"- {r}" for r in results)
 
 
+def collect_remember():
+    """Inject pending reminders and shopping lists into context."""
+    try:
+        from tools import remember as rem_tool
+        result = rem_tool.run_tool({"action": "list"})
+        if result and "Koi reminder" not in result:
+            return f"[Pending reminders/lists]\n{result}"
+    except Exception:
+        pass
+    return ""
+
+
 def collect_screen_cache():
     """Return the most recent screen OCR snapshot only when the content has changed."""
     global _last_injected_screen_hash
@@ -176,12 +196,12 @@ def build_context(user_input):
     The output is meant to be injected as a system-level reference — not
     as a user message that gets echoed back.  Keep it compact."""
     folders = get_daily_folders_sorted()
-    now = datetime.now()
 
     parts = []
 
-    # Current date and time — so LLM can answer time questions
-    parts.append(f"Current date/time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}")
+    # Rich time/schedule context from enricher
+    user_ctx = build_user_context()
+    parts.append(format_for_prompt(user_ctx))
 
     # Identity
     identity = collect_identity()
@@ -192,6 +212,11 @@ def build_context(user_input):
     facts = collect_facts()
     if facts:
         parts.append(facts)
+
+    # Pending reminders / shopping lists / errands
+    remember_items = collect_remember()
+    if remember_items:
+        parts.append(remember_items)
 
     # Active tasks
     tasks = collect_tasks()

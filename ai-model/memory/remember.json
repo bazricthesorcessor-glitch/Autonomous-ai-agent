@@ -1,0 +1,10 @@
+{
+  "reminders": [],
+  "shopping_lists": {
+    "grocery": [],
+    "stationery": [],
+    "dairy": [],
+    "other": []
+  },
+  "errands": []
+}

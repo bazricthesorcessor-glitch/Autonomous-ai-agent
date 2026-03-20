@@ -21,7 +21,11 @@
       "executor",
       "computer_use",
       "browser_control",
-      "actions"
+      "actions",
+      "remember",
+      "daily_log",
+      "cloud_ai",
+      "google"
     ]
   },
   "settings": {

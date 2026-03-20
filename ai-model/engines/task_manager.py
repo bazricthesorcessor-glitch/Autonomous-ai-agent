@@ -79,41 +79,97 @@ def create_task(
     credentials: dict = None,
     category: str = "task_request",
     plan: list | None = None,
+    priority: int = 5,
 ) -> str:
-    """Create a new in-progress task. Returns the task id."""
+    """Create a new in-progress task. Returns the task id.
+
+    Priority levels:
+      10 = Critical (security, urgent shout)
+       8 = Urgent (today's deadline, form to fill, explicit "urgent")
+       5 = Normal (default — searches, explanations, regular tasks)
+       3 = Background (downloads, long research)
+       1 = Idle (cleanup, summarization)
+    """
     with _task_lock:
         data = _load()
         task = {
-            "id":           str(uuid.uuid4())[:8],
-            "title":        title,
-            "description":  description,
-            "credentials":  credentials or {},
-            "category":     category,
-            "plan":         plan or [],
-            "steps":        [],
-            "status":       "in_progress",
-            "created_at":   _now(),
-            "last_updated": _now(),
+            "id":            str(uuid.uuid4())[:8],
+            "title":         title,
+            "description":   description,
+            "credentials":   credentials or {},
+            "category":      category,
+            "plan":          plan or [],
+            "steps":         [],
+            "status":        "in_progress",
+            "priority":      priority,
+            "paused_at_step": None,
+            "paused_context": None,
+            "created_at":    _now(),
+            "last_updated":  _now(),
         }
         data["active"].append(task)
         _save(data)
-        print(f"[TaskManager] Created task {task['id']}: {title}")
+        print(f"[TaskManager] Created task {task['id']} (priority={priority}): {title}")
         return task["id"]
 
 
 def get_active_task() -> dict | None:
-    """Return the first in-progress task, or None."""
+    """Return the highest-priority in-progress task, or None."""
     data = _load()
-    for task in data.get("active", []):
-        if task.get("status") == "in_progress":
-            return task
-    return None
+    running = [t for t in data.get("active", []) if t.get("status") == "in_progress"]
+    if not running:
+        return None
+    return max(running, key=lambda t: t.get("priority", 5))
 
 
 def get_active_tasks() -> list:
-    """Return ALL in-progress tasks. Planner should be aware of all of them."""
+    """Return all in-progress tasks. Planner should be aware of all of them."""
     data = _load()
     return [t for t in data.get("active", []) if t.get("status") == "in_progress"]
+
+
+def get_highest_priority_active() -> dict | None:
+    """Return the highest priority in-progress (non-paused) task."""
+    running = get_active_tasks()
+    if not running:
+        return None
+    return max(running, key=lambda t: t.get("priority", 5))
+
+
+def pause_task(task_id: str, step_index: int, context: dict):
+    """Pause a running task and save its state for later resumption."""
+    with _task_lock:
+        data = _load()
+        for task in data["active"]:
+            if task["id"] == task_id:
+                task["status"] = "paused"
+                task["paused_at_step"] = step_index
+                task["paused_context"] = context
+                task["last_updated"] = _now()
+                _save(data)
+                print(f"[TaskManager] Paused task {task_id} at step {step_index}")
+                return
+
+
+def resume_task(task_id: str) -> dict | None:
+    """Resume a paused task. Returns the saved context, or None if not found."""
+    with _task_lock:
+        data = _load()
+        for task in data["active"]:
+            if task["id"] == task_id and task.get("status") == "paused":
+                task["status"] = "in_progress"
+                task["last_updated"] = _now()
+                context = task.get("paused_context", {})
+                _save(data)
+                print(f"[TaskManager] Resumed task {task_id}")
+                return context
+    return None
+
+
+def get_paused_tasks() -> list:
+    """Return all paused tasks."""
+    data = _load()
+    return [t for t in data.get("active", []) if t.get("status") == "paused"]
 
 
 def get_task_by_id(task_id: str) -> dict | None:

@@ -29,8 +29,6 @@ _REGISTRY = {}
 _SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'skills')
 
 # ── Tool categories ──────────────────────────────────────────────────────────
-# Maps a category label to a list of tool names that belong to it.
-# Tools not in any category are shown under "other".
 TOOL_CATEGORIES = {
     "web_tools": {
         "label": "Web & Browser",
@@ -39,12 +37,12 @@ TOOL_CATEGORIES = {
     },
     "perception_tools": {
         "label": "Perception & Vision",
-        "desc":  "Read page state, locate UI elements, monitor OCR completion",
-        "tools": ["vision", "ui_parser", "screenshot"],
+        "desc":  "Read screen, locate UI elements, monitor output via MAI-UI",
+        "tools": ["vision", "screenshot"],
     },
     "computer_tools": {
         "label": "Desktop & Computer Control",
-        "desc":  "Screen automation, mouse/keyboard, window management, screenshots, UI detection",
+        "desc":  "Screen automation, mouse/keyboard, window management, screenshots",
         "tools": ["computer_use", "executor", "actions", "window_manager"],
     },
     "filesystem_tools": {
@@ -59,8 +57,8 @@ TOOL_CATEGORIES = {
     },
     "info_tools": {
         "label": "Information & Utilities",
-        "desc":  "System diagnostics, todos, utilities, coin flip, time",
-        "tools": ["system_diagnostics", "todos", "utilities"],
+        "desc":  "System diagnostics, todos, utilities, coin flip, time, remember, daily log",
+        "tools": ["system_diagnostics", "todos", "utilities", "remember", "daily_log", "cloud_ai", "system_state"],
     },
     "skill_tools": {
         "label": "Skills & Learning",
@@ -77,13 +75,12 @@ def _load():
 
     from tools import system_diagnostics, files, screenshot, window_manager, terminal_safe, todos, utilities, pdf
     from tools import code           # sandboxed Python code execution
-    from tools import web          # tools/web/   package (browser, search, fetch, wikipedia)
-    from tools import google       # tools/google/ package (drive, calendar, classroom)
-    from tools import computer_use    # screen OCR + mouse/keyboard automation
-    from tools import browser_control  # Playwright DOM-based web automation (Layer 1)
-    from tools import ui_parser       # YOLO UI detection + targeted OCR
-    from tools import vision          # structured perception interface
-    from tools import executor        # atomic GUI action executor
+    from tools import web            # tools/web/ package (browser, search, fetch, wikipedia)
+    from tools import google         # tools/google/ package (drive, calendar, classroom)
+    from tools import computer_use   # MAI-UI screen interaction
+    from tools import browser_control  # lightweight browser stub
+    from tools import vision         # MAI-UI structured perception
+    from tools import executor       # atomic GUI action executor
     _REGISTRY = {
         'system_diagnostics': system_diagnostics,
         'file_search':        files,
@@ -98,7 +95,6 @@ def _load():
         'computer_use':       computer_use,
         'browser_control':    browser_control,
         'code':               code,
-        'ui_parser':          ui_parser,
         'vision':             vision,
         'executor':           executor,
     }
@@ -113,6 +109,22 @@ def _load():
     # Skill builder — lets the AI create/manage learned skills
     from tools import skill_builder
     _REGISTRY['skill_builder'] = skill_builder
+
+    # Remember tool — explicit zero-hallucination memory store
+    from tools import remember
+    _REGISTRY['remember'] = remember
+
+    # Daily log — structured homework/checkin tracker for each day
+    from tools import daily_log
+    _REGISTRY['daily_log'] = daily_log
+
+    # Cloud AI — asks Claude.ai / ChatGPT / Gemini via browser automation
+    from tools import cloud_ai
+    _REGISTRY['cloud_ai'] = cloud_ai
+
+    # System state — live window/media/audio snapshot via MPRIS + hyprctl + pactl
+    from tools import system_state
+    _REGISTRY['system_state'] = system_state
 
     # Auto-load any skills the AI has already created
     _load_skills()
@@ -187,15 +199,9 @@ def _tool_desc(name: str, mod) -> str:
 
 
 def describe_tools() -> str:
-    """Returns a categorized listing of tools for the planner prompt.
-
-    Tools are grouped by category so the LLM can reason:
-      'I need a web tool' → look in Web & Browser category.
-    Tools not in any category appear under 'Other'.
-    """
+    """Returns a categorized listing of tools for the planner prompt."""
     _load()
 
-    # Build a set of tools that are assigned to a category
     categorized = set()
     for cat_info in TOOL_CATEGORIES.values():
         categorized.update(cat_info["tools"])
@@ -209,7 +215,6 @@ def describe_tools() -> str:
         for name in cat_tools:
             lines.append(_tool_desc(name, _REGISTRY[name]))
 
-    # Uncategorized tools (dynamic skills, etc.)
     other = [n for n in _REGISTRY if n not in categorized]
     if other:
         lines.append("  [Other / Learned Skills]")

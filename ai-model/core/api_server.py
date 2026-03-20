@@ -51,20 +51,13 @@ def _fallback(path):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def log_conversation(user_msg: str, ai_msg: str):
-    """Appends the interaction to today's raw log file.
-
-    Sanitizes the AI response: strips fake multi-turn dialogue that the
-    model sometimes generates (e.g. "**Divyansh:** ...\n**Avril:** ...").
-    Only the first real response paragraph is kept.
-    """
+    """Appends the interaction to today's raw log file."""
     import re
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     log_path = config.get_raw_log_path()
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
-    # Strip fake dialogue blocks and training artifacts the LLM appends
     clean = ai_msg.strip()
-    # Cut at the first fake conversation / training-data marker
     for marker in [
         '\n**Divyansh:', '\n**Avril:', '\n**Avrirl:',
         '\n[2026-', '\n--- 2026-', '\n---\n\n**',
@@ -79,7 +72,6 @@ def log_conversation(user_msg: str, ai_msg: str):
         if idx > 0:
             clean = clean[:idx]
     clean = clean.strip()
-    # Cap logged response length to prevent log bloat
     if len(clean) > 400:
         clean = clean[:400] + "..."
 
@@ -94,7 +86,6 @@ def _system_status() -> dict:
         "model": config.CHAT_MODEL,
         "decision_model": config.DECISION_MODEL,
     }
-    # Try psutil first (most accurate)
     try:
         import psutil
         mem = psutil.virtual_memory()
@@ -110,7 +101,6 @@ def _system_status() -> dict:
     except ImportError:
         pass
 
-    # Fallback: /proc/meminfo + df
     try:
         with open("/proc/meminfo") as f:
             mem_lines = {l.split(':')[0]: l.split(':')[1].strip() for l in f}
@@ -231,28 +221,28 @@ def _handle_command(cmd: str):
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    data = request.json
-    user_message = data.get('message', '').strip()
-
+def _process_message(user_message: str) -> tuple[str, int]:
+    """
+    Core message handler shared by /chat and /voice.
+    Returns (json_response_string, http_status_code).
+    """
     if not user_message:
         return jsonify({'error': 'No message provided'}), 400
 
     if len(user_message) > _MAX_MSG_LEN:
-        return jsonify({'error': f'Message too long ({len(user_message)} chars; max {_MAX_MSG_LEN})'}), 413
+        return (
+            jsonify({'error': f'Message too long ({len(user_message)} chars; max {_MAX_MSG_LEN})'}),
+            413,
+        )
 
     print(f"Received: {user_message}")
 
-    # 0. Handle !commands — bypass agent loop entirely
     cmd_response = _handle_command(user_message)
     if cmd_response is not None:
         log_conversation(user_message, cmd_response)
-        return jsonify({'response': cmd_response})
+        return jsonify({'response': cmd_response}), 200
 
     try:
-        # Fast path: greetings skip context + embedding; chat questions skip
-        # only the planner but still get memory context.
         active_tasks = task_manager.get_active_tasks()
         fast = agent_loop.classify_fast_path(user_message) if not active_tasks else 'agent'
 
@@ -263,10 +253,9 @@ def chat():
                 persona_prompt = personality.get_persona(user_message)
             ai_response = agent_loop.run_turn(user_message, persona_prompt, memory_context="")
             log_conversation(user_message, ai_response)
-            return jsonify({'response': ai_response})
+            return jsonify({'response': ai_response}), 200
 
         if fast == 'chat':
-            # Tier 2: build memory context (for identity/fact recall) but skip planner
             try:
                 fact_engine.process_fact_query(user_message)
             except Exception as fe:
@@ -280,35 +269,26 @@ def chat():
             persona_prompt += f"\nCurrent date and time: {now_str}"
             ai_response = agent_loop.run_turn(user_message, persona_prompt, memory_context)
             log_conversation(user_message, ai_response)
-            return jsonify({'response': ai_response})
+            return jsonify({'response': ai_response}), 200
 
-        # Normal path: full context building + agent loop
-        # 1. Extract facts FIRST so they're available during context build
         try:
             fact_engine.process_fact_query(user_message)
         except Exception as fe:
             print(f"[FactEngine] {fe}")
 
-        # 2. Build memory context (now includes newly extracted facts)
         memory_context = context_builder.build_context(user_message)
 
-        # 3. Select persona (locked persona overrides keyword detection)
         if _PERSONA_STATE["locked"] and _PERSONA_STATE["mode"]:
             persona_prompt = personality.get_persona_for_mode(_PERSONA_STATE["mode"])
         else:
             persona_prompt = personality.get_persona(user_message)
 
-        # Inject current time into persona so the model always knows it
         now_str = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
         persona_prompt += f"\nCurrent date and time: {now_str}"
 
-        # 4. Run agent loop (plan → tool → respond)
         ai_response = agent_loop.run_turn(user_message, persona_prompt, memory_context)
-
-        # 5. Log
         log_conversation(user_message, ai_response)
 
-        # 6. Store user message in vector memory (background — don't block response)
         def _bg_store(msg):
             try:
                 memory_engine.add_memory(msg)
@@ -316,16 +296,66 @@ def chat():
                 print(f"[MemoryEngine] add_memory failed: {me}")
         threading.Thread(target=_bg_store, args=(user_message,), daemon=True).start()
 
-        return jsonify({'response': ai_response})
+        return jsonify({'response': ai_response}), 200
 
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/chat', methods=['POST'])
+def chat():
+    data = request.json or {}
+    user_message = data.get('message', '').strip()
+    response, status = _process_message(user_message)
+    return response, status
+
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'online', 'model': config.CHAT_MODEL})
+
+
+@app.route('/voice', methods=['POST'])
+def voice_input():
+    """
+    STT endpoint — accepts an audio file, transcribes it via Whisper,
+    then routes the transcribed text through the same pipeline as /chat.
+    """
+    audio = request.files.get('audio')
+    if not audio:
+        return jsonify({'error': 'No audio file. POST form-data with field "audio".'}), 400
+
+    import tempfile
+    import os as _os
+
+    original_name = audio.filename or "audio.webm"
+    suffix = _os.path.splitext(original_name)[1] or ".webm"
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    try:
+        with _os.fdopen(fd, 'wb') as f:
+            audio.save(f)
+
+        try:
+            import whisper
+        except ImportError:
+            return jsonify({'error': 'openai-whisper not installed. Run: pip install openai-whisper'}), 500
+
+        model = whisper.load_model("base")
+        result = model.transcribe(tmp_path)
+        text = result.get('text', '').strip()
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except Exception:
+            pass
+
+    if not text:
+        return jsonify({'error': 'No speech detected in audio'}), 400
+
+    print(f"[Voice STT] Transcribed: {text!r}")
+    response, status = _process_message(text)
+    return response, status
 
 
 @app.route('/tasks', methods=['GET'])
@@ -368,10 +398,7 @@ def ui():
 
 @app.route('/persona', methods=['POST'])
 def set_persona():
-    """Set (and optionally lock) the active persona mode.
-
-    Payload: { "mode": "coding", "locked": true }
-    """
+    """Set (and optionally lock) the active persona mode."""
     data   = request.json or {}
     mode   = data.get('mode', 'default')
     locked = bool(data.get('locked', False))
@@ -403,18 +430,18 @@ def list_skills():
     return jsonify({'result': skill_builder.run_tool({"action": "list"})})
 
 
-@app.route('/skills/<name>/approve', methods=['POST'])
-def approve_skill(name):
+@app.route('/skills/<n>/approve', methods=['POST'])
+def approve_skill(n):
     """Approve a pending skill and activate it."""
     from tools import skill_builder
-    return jsonify({'result': skill_builder.run_tool({"action": "approve", "name": name})})
+    return jsonify({'result': skill_builder.run_tool({"action": "approve", "name": n})})
 
 
-@app.route('/skills/<name>/reject', methods=['POST'])
-def reject_skill(name):
+@app.route('/skills/<n>/reject', methods=['POST'])
+def reject_skill(n):
     """Reject a pending skill and delete it."""
     from tools import skill_builder
-    return jsonify({'result': skill_builder.run_tool({"action": "reject", "name": name})})
+    return jsonify({'result': skill_builder.run_tool({"action": "reject", "name": n})})
 
 
 # ── Autonomous mode ───────────────────────────────────────────────────────────
@@ -428,9 +455,7 @@ def get_autonomous():
 
 @app.route('/autonomous', methods=['POST'])
 def set_autonomous():
-    """Enable or disable autonomous background tasks.
-    Payload: { "enabled": true|false }
-    """
+    """Enable or disable autonomous background tasks."""
     from core import autonomous_mode
     data    = request.json or {}
     enabled = bool(data.get('enabled', True))
@@ -450,9 +475,7 @@ def get_todos():
 
 @app.route('/todos/<todo_id>', methods=['PATCH'])
 def update_todo(todo_id):
-    """Update the status of a single todo item.
-    Payload: { "status": "pending"|"in_progress"|"done" }
-    """
+    """Update the status of a single todo item."""
     from engines import todo_manager
     data   = request.json or {}
     status = data.get('status', 'done')
@@ -492,104 +515,50 @@ def get_screen():
 
 @app.route('/debug-screen', methods=['GET'])
 def debug_screen():
-    """Trigger a screen scan and return the detected UI elements + screenshot path.
-
-    Uses ui_parser (YOLO + targeted OCR) when a model is loaded,
-    falls back to screen_map OCR-only pipeline otherwise.
+    """Trigger a MAI-UI screen scan and return detected elements.
 
     Query params:
-      ?app=firefox  — restrict scan to a specific window (default: full screen)
+      ?app=firefox  — unused, kept for API compatibility
     Returns JSON with:
-      - source: "yolo" or "ocr" (which pipeline was used)
-      - screenshot_path: path to the captured PNG
+      - source: "mai_ui"
       - timestamp: when the scan was taken
-      - element_count: total detected elements
-      - elements: list of {text, x, y, w, h, cx, cy, type, conf}
-      - by_type: elements grouped by type for quick inspection
+      - elements_text: MAI-UI list_elements output
     """
-    from tools import ui_parser
+    from tools import vision
 
-    app_hint = request.args.get('app', '')
-    if app_hint:
-        from tools.computer_use import _get_window_region
-        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
-    else:
-        min_x, max_x, min_y, max_y = 0, 99999, 0, 99999
-
-    elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
-
-    # Group by type for easier debugging
-    by_type = {}
-    for el in elements:
-        t = el.get('type', 'unknown')
-        by_type.setdefault(t, []).append({
-            'text': (el.get('text') or '')[:60],
-            'cx': el['cx'], 'cy': el['cy'],
-            'w': el['w'], 'h': el['h'],
-        })
-
-    # Detect which pipeline was used
-    source = "ocr"
-    try:
-        cache = config.safe_load_json(
-            os.path.join(config.SCREENSHOT_DIR, "screen_map.json"), {}
-        )
-        source = cache.get("source", "ocr")
-    except Exception:
-        pass
-
-    screenshot_path = os.path.join(config.SCREENSHOT_DIR, '_ui_parse.png')
+    elements_text = vision.run_tool({"action": "list_elements"})
 
     return jsonify({
-        'source': source,
-        'screenshot_path': screenshot_path,
+        'source': 'mai_ui',
         'timestamp': __import__('time').strftime('%Y-%m-%d %H:%M:%S'),
-        'element_count': len(elements),
-        'elements': elements,
-        'by_type': by_type,
+        'elements_text': elements_text,
     })
 
 
 @app.route('/ui-parse', methods=['GET'])
 def ui_parse():
-    """Run the UI parser and return structured element data.
+    """Locate a UI element or list all visible elements using MAI-UI.
 
     Query params:
-      ?app=firefox      — restrict to a window
-      ?query=Search     — find a specific element (returns single match)
-      ?type=button      — filter by element type
+      ?query=Search   — locate a specific element, returns coordinates
+      (no query)      — list all interactive elements MAI-UI can see
     """
-    from tools import ui_parser
+    from tools import vision
 
-    app_hint = request.args.get('app', '')
     query = request.args.get('query', '').strip()
-    el_type = request.args.get('type', '').strip()
 
-    if app_hint:
-        from tools.computer_use import _get_window_region
-        min_x, max_x, min_y, max_y = _get_window_region(app_hint)
-    else:
-        min_x, max_x, min_y, max_y = 0, 99999, 0, 99999
-
-    elements = ui_parser.parse_screen(min_x, max_x, min_y, max_y)
-
-    # Single element search
     if query:
-        el = ui_parser.find_element(query, elements)
-        if el:
-            return jsonify({'found': True, 'element': el})
-        return jsonify({'found': False, 'query': query, 'total_elements': len(elements)})
+        result_raw = vision.run_tool({"action": "locate", "query": query})
+        try:
+            result = json.loads(result_raw)
+        except Exception:
+            result = {"raw": result_raw}
+        return jsonify(result)
 
-    # Type filter
-    if el_type:
-        filtered = ui_parser.find_elements_by_type(el_type, elements)
-        return jsonify({'type': el_type, 'count': len(filtered), 'elements': filtered})
-
-    # Full parse result
+    elements_text = vision.run_tool({"action": "list_elements"})
     return jsonify({
-        'model_available': ui_parser.is_model_available(),
-        'count': len(elements),
-        'elements': elements,
+        'source': 'mai_ui',
+        'elements_text': elements_text,
     })
 
 

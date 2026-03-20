@@ -48,6 +48,8 @@ ARCHITECTURE:
       +-- core/agent_loop.py        (2-tier fast path + plan-tool-respond loop)
       +-- core/brain.py             (model routing + fallback)
       +-- core/context_builder.py   (memory assembly, raw log truncation, screen cache)
+      +-- core/context_enricher.py  (live UserContext: exam proximity, strictness, schedule)
+      +-- core/voice.py             (edge-tts TTS + mood-based prosody: normal/sad/crying/firm)
       +-- core/state.py             (agentic state machine)
       +-- core/system_shortcuts.py  (Hyprland shortcuts for planner awareness)
       +-- core/autonomous_mode.py   (global flag — enable/disable background tasks)
@@ -62,17 +64,23 @@ ARCHITECTURE:
       +-- tools/files.py
       +-- tools/screenshot.py       (active-window OCR, noise-filtered, writes screen_cache)
       +-- tools/system_diagnostics.py
+      +-- tools/system_state.py     (live snapshot: MPRIS + hyprctl + pactl — injected every turn)
       +-- tools/actions.py          (ydotool mouse/keyboard — individual low-level moves)
       +-- tools/computer_use.py     (scan_screen, click_map, smart_click, type_into, open_url)
       +-- tools/ui_parser.py        (YOLO UI detection + targeted OCR — replaces OCR-only)
       +-- tools/screen_map.py       (structured element map: OCR fallback pipeline)
+      +-- tools/vision.py           (3-layer perception: DOM → AT-SPI → Qwen2-VL grid overlay)
+      +-- tools/executor.py         (atomic GUI actions: CLICK/TYPE/SCROLL/PRESS/MOVE + volume/notify)
       +-- tools/browser_control.py  (Playwright DOM-based web automation — Layer 1)
       +-- tools/ui_positions.json   (pre-saved pixel positions per site/app)
       +-- tools/window_manager.py   (hyprctl window/app control)
       +-- tools/terminal_safe.py    (allowlisted safe shell execution)
       +-- tools/todos.py            (agent tool — create/update/list/clear todos)
       +-- tools/utilities.py        (flip_coin, roll_dice, time_now, convert_units, etc.)
-      +-- tools/skill_builder.py    (AI skill creation with USER APPROVAL GATE)
+      +-- tools/skill_builder.py    (AI skill creation — approval gate + regex+AST safety scanner + versioned .bak backups)
+      +-- tools/remember.py         (zero-hallucination memory: reminders/shopping/errands)
+      +-- tools/daily_log.py        (structured homework + checkin tracker per day)
+      +-- tools/cloud_ai.py         (ask Claude/ChatGPT/Gemini via browser — no API key needed)
       +-- tools/code.py             (sandboxed Python exec/eval — restricted builtins)
       +-- tools/skills/             (AI-created skill files, auto-loaded on startup)
       +-- tools/web/                (web tools package)
@@ -85,9 +93,9 @@ ARCHITECTURE:
       +-- helpers/                  (start.sh, stop.sh, status.sh, engineering_brief.py)
       +-- models/                   (UI detection model: ui_detect.pt)
 
-  API:  /chat  /health  /tasks  /status  /logs  /persona  /screen
+  API:  /chat  /health  /tasks  /status  /logs  /persona  /screen  /voice
         /autonomous  /todos  /todos/<id>  /todos/clear-done  /tool-feed
-        /debug-screen  /ui-parse  /skills  /skills/<name>/approve|reject
+        /debug-screen  /ui-parse  /skills  /skills/<n>/approve|reject
   UI:   http://localhost:8000/app  (new full control panel)
         http://localhost:8000/ui   (legacy inline text console)
 """
@@ -109,6 +117,8 @@ SECTIONS = [
             ("ai-model/core/agent_loop.py",         "2-tier fast path + plan-tool-respond"),
             ("ai-model/core/state.py",              "agentic state machine"),
             ("ai-model/core/context_builder.py",    "memory context assembly"),
+            ("ai-model/core/context_enricher.py",   "live UserContext: exam/schedule/enrichment"),
+            ("ai-model/core/voice.py",              "TTS: edge-tts + mood prosody"),
             ("ai-model/core/autonomous_mode.py",    "autonomous flag"),
             ("ai-model/core/system_shortcuts.py",   "Hyprland shortcuts"),
         ],
@@ -129,7 +139,7 @@ SECTIONS = [
     ),
     (
         "3/10 — Tool Infrastructure",
-        "Registry (categories), files, screenshot, diagnostics, terminal, utils, code",
+        "Registry (categories), files, screenshot, diagnostics, system_state, terminal, utils, code",
         [
             ("ai-model/tools/__init__.py",          ""),
             ("ai-model/tools/registry.py",          "tool loader + categories + dispatch"),
@@ -137,16 +147,22 @@ SECTIONS = [
             ("ai-model/tools/files.py",             "file CRUD"),
             ("ai-model/tools/screenshot.py",        "active-window OCR + noise filter"),
             ("ai-model/tools/system_diagnostics.py","CPU/RAM/disk/network"),
+            ("ai-model/tools/system_state.py",      "live MPRIS+hyprctl+pactl snapshot — injected every turn"),
             ("ai-model/tools/terminal_safe.py",     "allowlisted shell commands"),
             ("ai-model/tools/todos.py",             "agent-facing todo CRUD"),
             ("ai-model/tools/utilities.py",         "coin flip, dice, time, conversions"),
             ("ai-model/tools/code.py",              "sandboxed Python exec/eval"),
+            ("ai-model/tools/remember.py",          "zero-hallucination reminders/shopping/errands"),
+            ("ai-model/tools/daily_log.py",          "structured homework and checkin tracker"),
+            ("ai-model/tools/cloud_ai.py",           "ask Claude/ChatGPT/Gemini via browser — no API key"),
         ],
     ),
     (
         "4/10 — Computer Control",
-        "computer_use (smart_click, type_into), ui_parser (YOLO), screen_map (OCR), actions, window_mgr, browser_control",
+        "vision (3-layer: DOM→AT-SPI→Qwen2-VL), executor (ydotool), computer_use, ui_parser, screen_map, actions, window_mgr, browser_control",
         [
+            ("ai-model/tools/vision.py",            "3-layer perception: DOM → AT-SPI → Qwen2-VL grid"),
+            ("ai-model/tools/executor.py",          "atomic GUI actions: CLICK/TYPE/SCROLL/PRESS/MOVE + volume/notify"),
             ("ai-model/tools/computer_use.py",      "high-level: smart_click, type_into, scan_screen"),
             ("ai-model/tools/ui_parser.py",         "YOLO UI detection + targeted OCR"),
             ("ai-model/tools/screen_map.py",        "OCR-only fallback element map"),
@@ -158,15 +174,16 @@ SECTIONS = [
     ),
     (
         "5/10 — Web Tools",
-        "Web package: browser, DuckDuckGo search, fetch/scrape, Wikipedia; PDF reader",
+        "Web package: browser, DuckDuckGo search (+ browser_control fallback), deep_research pipeline, fetch/scrape (+ JS-shell detection), Wikipedia; PDF reader",
         [
             ("ai-model/tools/web/__init__.py",      "dispatcher"),
             ("ai-model/tools/web/http_client.py",   "SSL-aware HTTP + html_to_text"),
             ("ai-model/tools/web/browser.py",       "open_browser"),
-            ("ai-model/tools/web/search.py",        "DuckDuckGo + Lite fallback"),
-            ("ai-model/tools/web/fetch.py",         "fetch_page, scrape_page"),
+            ("ai-model/tools/web/search.py",        "DuckDuckGo + Lite + browser_control fallback"),
+            ("ai-model/tools/web/fetch.py",         "fetch_page, scrape_page + JS-shell detection"),
             ("ai-model/tools/web/wikipedia.py",     "wikipedia lookup"),
             ("ai-model/tools/web/inspect.py",       "inspect_page, find_forms, etc."),
+            ("ai-model/tools/web/research.py",      "deep_research multi-source pipeline"),
             ("ai-model/tools/pdf.py",               "PDF read/analyse"),
         ],
     ),
@@ -209,15 +226,22 @@ SECTIONS = [
         "_SCAN:ui",  # special marker: auto-scan this directory
     ),
     (
-        "10/10 — Skills + Helpers + Legacy",
-        "skill_builder (approval gate), AI-learned skills, launcher scripts, legacy code",
+        "10/10 — Skills + Helpers + Memory Configs + Legacy",
+        "skill_builder (approval gate + regex+AST scanner + versioned backups), AI-learned skills, launcher scripts, memory configs, legacy code",
         [
-            ("ai-model/tools/skill_builder.py",     "AI skill creation + approval gate"),
-            ("ai-model/tools/skills/__init__.py",   "skills package"),
+            ("ai-model/tools/skill_builder.py",          "AI skill creation — approval gate, dual-phase safety scanner, .bak versioning"),
+            ("ai-model/tools/skills/__init__.py",         "skills package"),
             "_SCAN:ai-model/tools/skills",
             "_SCAN:ai-model/helpers",
-            ("ai-model/legacy/router.py",           "LEGACY — old monolithic router"),
-            ("ai-model/legacy/ai_agent.py",         "LEGACY — old summarizer agent"),
+            ("ai-model/memory/schedule.json",             "college schedule + exams + strictness ramp"),
+            ("ai-model/memory/goals.json",                "core goals + scheduled goals"),
+            ("ai-model/memory/behavioral_patterns.json",  "observed behavioral patterns"),
+            ("ai-model/memory/prep_status.json",          "per-subject exam prep completion"),
+            ("ai-model/memory/remember.json",             "reminders / shopping lists / errands"),
+            ("ai-model/memory/daily_log.json",             "daily homework + checkin log"),
+            ("ai-model/memory/long_term_memory.json",     "long-term milestones"),
+            ("ai-model/legacy/router.py",                 "LEGACY — old monolithic router"),
+            ("ai-model/legacy/ai_agent.py",               "LEGACY — old summarizer agent"),
         ],
     ),
 ]

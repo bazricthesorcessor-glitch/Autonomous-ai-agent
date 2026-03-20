@@ -7,14 +7,16 @@ Structure:
     __init__.py      ← this file (dispatcher)
     http_client.py   ← shared SSL-aware HTTP helpers + HTML-to-text
     browser.py       ← open_browser (Firefox only)
-    search.py        ← web_search   (DuckDuckGo HTML + Lite fallback)
-    fetch.py         ← fetch_page, scrape_page
+    search.py        ← web_search   (DuckDuckGo HTML + Lite + browser_control fallback)
+    fetch.py         ← fetch_page, scrape_page (+ JS-shell detection)
     wikipedia.py     ← wikipedia    (REST API, no key)
     inspect.py       ← inspect_page, find_forms, find_buttons, find_links, find_headings
+    research.py      ← deep_research (multi-source pipeline)
 
 Usage:
   from tools import web
   web.run_tool({"action": "web_search",    "query": "python news"})
+  web.run_tool({"action": "deep_research", "query": "flip flops vs latches DSD"})
   web.run_tool({"action": "open_browser",  "url": "github.com"})
   web.run_tool({"action": "fetch_page",    "url": "https://example.com"})
   web.run_tool({"action": "scrape_page",   "url": "https://python.org"})
@@ -31,6 +33,7 @@ from tools.web.browser   import open_browser
 from tools.web.search    import web_search
 from tools.web.fetch     import fetch_page, scrape_page
 from tools.web.wikipedia import wikipedia
+from tools.web.research  import deep_research
 from tools.web.inspect   import (
     inspect_page, find_forms, find_buttons, find_links, find_headings
 )
@@ -39,22 +42,24 @@ from tools.web.inspect   import (
 def _list_actions(_: dict) -> str:
     return (
         "Web tools  (tools/web/)\n"
-        "  open_browser    Open URL in detected browser   [url, private=false]          → browser.py\n"
-        "  web_search      DuckDuckGo + Lite fallback     [query, max_results=5]        → search.py\n"
-        "  fetch_page      Readable page text             [url, max_chars=3000]         → fetch.py\n"
-        "  scrape_page     Text + external links          [url, max_chars=2000]         → fetch.py\n"
-        "  wikipedia       Wikipedia summary              [query, lang=en, full=false]  → wikipedia.py\n"
-        "  inspect_page    Full page structure map        [url, max_links=20]           → inspect.py\n"
-        "  find_forms      All forms & input fields       [url]                         → inspect.py\n"
-        "  find_buttons    All buttons & submits          [url]                         → inspect.py\n"
-        "  find_links      All navigation links           [url, max_links=30]           → inspect.py\n"
-        "  find_headings   Heading hierarchy h1–h3        [url]                         → inspect.py"
+        "  open_browser    Open URL in detected browser   [url, private=false]                    → browser.py\n"
+        "  web_search      DuckDuckGo + Lite + browser FB [query, max_results=5]                  → search.py\n"
+        "  deep_research   Multi-source research pipeline [query, max_sources=3]                  → research.py\n"
+        "  fetch_page      Readable page text             [url, max_chars=3000]                   → fetch.py\n"
+        "  scrape_page     Text + external links          [url, max_chars=2000]                   → fetch.py\n"
+        "  wikipedia       Wikipedia summary              [query, lang=en, full=false]             → wikipedia.py\n"
+        "  inspect_page    Full page structure map        [url, max_links=20]                     → inspect.py\n"
+        "  find_forms      All forms & input fields       [url]                                   → inspect.py\n"
+        "  find_buttons    All buttons & submits          [url]                                   → inspect.py\n"
+        "  find_links      All navigation links           [url, max_links=30]                     → inspect.py\n"
+        "  find_headings   Heading hierarchy h1–h3        [url]                                   → inspect.py"
     )
 
 
 _ACTIONS = {
     "open_browser":  open_browser,
     "web_search":    web_search,
+    "deep_research": deep_research,
     "fetch_page":    fetch_page,
     "scrape_page":   scrape_page,
     "wikipedia":     wikipedia,

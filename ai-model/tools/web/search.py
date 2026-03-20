@@ -1,6 +1,7 @@
 # ========================= tools/web/search.py =========================
-"""DuckDuckGo web search — HTML parser with DDG Lite fallback."""
+"""DuckDuckGo web search — HTML parser with DDG Lite fallback, browser_control tertiary fallback."""
 
+import urllib.parse
 from html.parser import HTMLParser
 from tools.web.http_client import http_post, http_get
 from tools.web.browser import open_browser
@@ -125,6 +126,20 @@ def web_search(args: dict) -> str:
         results = _search_lite(query, max_r)
 
     if not results:
+        # ── Tertiary fallback: browser_control + DuckDuckGo ───────────────────
+        # Kicks in when both HTTP endpoints are rate-limited or blocked.
+        try:
+            from tools import browser_control as _bc
+            bc_url = "https://duckduckgo.com/?q=" + urllib.parse.quote_plus(query)
+            _bc.run_tool({"action": "open", "url": bc_url})
+            bc_text = _bc.run_tool({"action": "get_text", "max_length": 2500})
+            if bc_text and len(bc_text.strip()) > 150 and not bc_text.startswith("["):
+                return (
+                    f"Search results (browser fallback) for: **{query}**\n\n"
+                    + bc_text[:2500]
+                )
+        except Exception:
+            pass
         if rate_limited:
             return f"[web_search] DuckDuckGo rate-limited the request for: '{query}'. Try again shortly."
         return f"[web_search] No results found for: '{query}'"

@@ -5,6 +5,18 @@ import urllib.error
 from html.parser import HTMLParser
 from tools.web.http_client import http_get, html_to_text
 
+# Markers that indicate the fetched page is a JS-rendered shell with no real content.
+_JS_SHELLS = (
+    '__next_data__',
+    'react-root',
+    'ng-app',
+    'cloudflare',
+    'cf-browser-verification',
+    '__nuxt__',
+    'window.__initial_state__',
+    'window.__store__',
+)
+
 
 class _LinkExtractor(HTMLParser):
     def __init__(self):
@@ -38,6 +50,16 @@ def fetch_page(args: dict) -> str:
         return f"[fetch_page] Error: {e}"
 
     text = html_to_text(html)
+
+    # JS-shell detection: if extracted text is tiny but the raw HTML has JS framework
+    # markers, the page needs JavaScript to render — redirect to browser_control.
+    if len(text.strip()) < 200 and any(m in html.lower() for m in _JS_SHELLS):
+        return (
+            f"[fetch_page] This page requires JavaScript to render. "
+            f"Use browser_control instead.\n"
+            f"URL: {url}"
+        )
+
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n\n[... truncated at {max_chars} chars]"
 

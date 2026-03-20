@@ -19,8 +19,11 @@ Actions:
   reject  — user rejects a pending skill → deletes the file
 """
 
+import ast
+import hashlib
 import os
 import re
+import shutil
 import sys
 import json
 import importlib.util
@@ -31,15 +34,85 @@ _PENDING_META = os.path.join(SKILLS_DIR, '_pending.json')
 
 # Patterns that must NEVER appear in AI-generated skill code
 _DANGEROUS_PATTERNS = re.compile(
-    r'subprocess|os\.system|os\.popen|os\.exec|os\.remove|os\.unlink|shutil\.rmtree'
-    r'|__import__|eval\s*\(|exec\s*\(|open\s*\(.*/etc/'
+    # Process / shell execution
+    r'subprocess|os\.system|os\.popen|os\.exec|os\.spawn'
+    # Code injection
+    r'|__import__|eval\s*\(|exec\s*\(|compile\s*\('
+    # All file I/O — skills must use registry tools (file_search etc.) not raw open()
+    r'|open\s*\('
+    # File operations
+    r'|os\.remove|os\.unlink|os\.rename|os\.replace'
+    r'|os\.makedirs|os\.mkdir|os\.rmdir'
+    # Dangerous modules (full module block)
+    r'|shutil\b|pathlib\b|tempfile\b'
+    # Network / exfiltration
+    r'|requests\b|urllib\b|httpx\b|aiohttp\b'
     r'|socket\.socket|http\.server|smtplib'
-    r'|ctypes|cffi|importlib\.import_module',
+    # Low-level / FFI
+    r'|ctypes\b|cffi\b|importlib\.import_module'
+    # Encoding tricks to bypass detection
+    r'|base64\.b64decode|codecs\.decode',
     re.IGNORECASE,
 )
 
+# Modules that skills are never allowed to import (checked at AST level)
+_BLOCKED_IMPORTS = frozenset({
+    'subprocess', 'socket', 'requests', 'urllib', 'httpx', 'aiohttp',
+    'ctypes', 'cffi', 'shutil', 'tempfile', 'pathlib',
+    'ftplib', 'telnetlib', 'smtplib', 'poplib', 'imaplib',
+    'multiprocessing', 'threading', 'concurrent',
+})
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# Function/method names that skills are never allowed to call (checked at AST level)
+_BLOCKED_CALLS = frozenset({
+    'eval', 'exec', 'compile', '__import__',
+    'system', 'popen', 'spawn', 'execv', 'execve',   # os.*
+    'remove', 'unlink', 'rmdir', 'makedirs', 'mkdir', # os.*
+    'rename', 'replace',                               # os.*
+    'open',                                            # builtin
+})
+
+
+def _ast_scan(code: str) -> str | None:
+    """
+    AST-level scan for dangerous patterns that bypass regex (indirect calls,
+    attribute access, dynamic imports).
+
+    Returns a description of the violation, or None if the code is clean.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return f"Syntax error: {e}"
+
+    for node in ast.walk(tree):
+        # Direct name calls: eval(), exec(), open(), __import__()
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in _BLOCKED_CALLS:
+                    return f"Forbidden call: {node.func.id}()"
+            # Attribute calls: os.system(), os.open(), etc.
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr in _BLOCKED_CALLS:
+                    return f"Forbidden attribute call: .{node.func.attr}()"
+            # getattr(os, "system") pattern — catches dynamic attribute access
+            if isinstance(node.func, ast.Name) and node.func.id == 'getattr':
+                if node.args and isinstance(node.args[-1], ast.Constant):
+                    if node.args[-1].value in _BLOCKED_CALLS:
+                        return f"Forbidden getattr() call to: .{node.args[-1].value}"
+
+        # Import statements: import subprocess, from socket import ...
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = (alias.name or '').split('.')[0]
+                if root in _BLOCKED_IMPORTS:
+                    return f"Forbidden import: {alias.name}"
+        if isinstance(node, ast.ImportFrom):
+            root = (node.module or '').split('.')[0]
+            if root in _BLOCKED_IMPORTS:
+                return f"Forbidden import from: {node.module}"
+
+    return None
 
 def _ensure_dir():
     os.makedirs(SKILLS_DIR, exist_ok=True)
@@ -117,12 +190,20 @@ def _propose(args: dict) -> str:
     if 'def run_tool' not in code:
         return "[skill_builder] Skill code must contain a 'def run_tool(args)' function."
 
-    # Safety scan: block dangerous patterns
+    # Safety scan — Phase 1: regex (fast, catches literal patterns)
     match = _DANGEROUS_PATTERNS.search(code)
     if match:
         return (
             f"[skill_builder] BLOCKED: code contains forbidden pattern '{match.group()}'. "
-            "Skills cannot use subprocess, eval, exec, os.system, sockets, etc."
+            "Skills cannot use subprocess, eval, exec, os.system, sockets, file I/O, etc."
+        )
+
+    # Safety scan — Phase 2: AST (catches indirect calls, dynamic imports)
+    ast_violation = _ast_scan(code)
+    if ast_violation:
+        return (
+            f"[skill_builder] BLOCKED (AST): {ast_violation}. "
+            "Skills must not use forbidden functions even via getattr or dynamic access."
         )
 
     _ensure_dir()
@@ -149,10 +230,12 @@ def _propose(args: dict) -> str:
 
     # Mark as pending (NOT registered in the tool registry)
     pending = _load_pending()
+    prev_version = pending.get(name, {}).get('version', 0)
     pending[name] = {
-        'purpose': purpose,
+        'purpose':     purpose,
         'proposed_at': datetime.now().isoformat(),
-        'file': path,
+        'file':        path,
+        'version':     prev_version + 1,
     }
     _save_pending(pending)
 
@@ -188,11 +271,36 @@ def _approve(args: dict) -> str:
     except Exception as e:
         return f"[skill_builder] Skill '{name}' failed to load: {e}"
 
+    # Save a versioned backup of the approved code (.bak) so broken re-proposals
+    # can be rolled back by copying the most recent .bak back to {name}.py.
+    try:
+        with open(path, encoding='utf-8') as _f:
+            _code_bytes = _f.read().encode()
+        _hash = hashlib.md5(_code_bytes).hexdigest()[:8]
+        _version = pending.get(name, {}).get('version', 1)
+        _bak_path = os.path.join(SKILLS_DIR, f"{name}.v{_version}_{_hash}.bak")
+        shutil.copy2(path, _bak_path)
+        # Keep only the 3 most recent backups for this skill
+        _all_baks = sorted(
+            f for f in os.listdir(SKILLS_DIR)
+            if f.startswith(f"{name}.v") and f.endswith('.bak')
+        )
+        for _old in _all_baks[:-3]:
+            try:
+                os.remove(os.path.join(SKILLS_DIR, _old))
+            except OSError:
+                pass
+    except Exception:
+        pass  # backup failure is non-fatal — skill is still activated
+
     # Remove from pending
-    pending.pop(name, None)
+    _version = pending.pop(name, {}).get('version', 1)
     _save_pending(pending)
 
-    return f"Skill '{name}' APPROVED and activated. You can now use tool='{name}'."
+    return (
+        f"Skill '{name}' APPROVED and activated. You can now use tool='{name}'.\n"
+        f"Backup saved as v{_version}. To roll back: copy the .bak file back to {name}.py and reload."
+    )
 
 
 def _reject(args: dict) -> str:

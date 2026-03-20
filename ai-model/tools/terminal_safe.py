@@ -46,7 +46,7 @@ _ALLOWED_COMMANDS = {
     # Python/Node (running scripts)
     "python", "python3", "node",
     # Text tools
-    "echo", "printf", "awk", "sed", "sort", "uniq", "cut", "tr", "tee",
+    "echo", "printf", "awk", "sed", "sort", "uniq", "cut", "tr",
     # Directories
     "mkdir", "pwd", "cd",
     # System shortcuts and info
@@ -66,6 +66,14 @@ _BLOCKED_PATTERNS = [
     r'\bwipe\b', r'\bshred\b',                     # data destruction
     r':\(\)\s*\{.*fork\s*bomb',                    # fork bombs
     r'\bbase64\s+-d.*\|.*sh\b',                    # encoded payloads
+    r'\bsed\b.*\s-i\b',                            # in-place file overwrite
+    r'\btee\b',                                    # write to files via pipe
+    r'\bcurl\b.*\s-[oO]\b',                        # curl download to file
+    r'\bcurl\b.*--output\b',                       # curl download (long flag)
+    r'\bwget\b.*\s-O\b',                           # wget download to file
+    r'\bpython3?\s+-c\b',                          # arbitrary code execution
+    r'\|\s*(?:ba)?sh\b',                           # pipe into shell
+    r'\|\s*python',                                # pipe into python
 ]
 
 _BLOCKED_RE = re.compile("|".join(_BLOCKED_PATTERNS), re.IGNORECASE)
